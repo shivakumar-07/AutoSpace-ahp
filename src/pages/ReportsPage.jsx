@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { T, FONT } from "../theme";
-import { fmt, fmtDate, fmtTime, daysAgo, pct, getDebtAging, exportMovementsCSV, downloadCSV, generateCSV, margin, stockStatus, calculateWeightedAvgCost } from "../utils";
+import { fmt, fmtDate, fmtTime, daysAgo, pct, getDebtAging, exportMovementsCSV, downloadCSV, generateCSV, margin, stockStatus, calculateWeightedAvgCost, getCompanyInfo } from "../utils";
 import { StatCard, Btn, Input, Select } from "../components/ui";
 import { useStore } from "../store";
 
@@ -264,7 +264,7 @@ export function ReportsPage({ movements, products, activeShopId, onPaymentReceip
                                             )}
                                             {isReceivable && item.phone && (
                                                 <Btn size="xs" variant="ghost" onClick={() => {
-                                                    const msg = encodeURIComponent(`Hi ${item.name}, your pending balance at Ravi Auto Parts is ${fmt(item.total)}. Please settle at your earliest convenience. Thank you! 🙏`);
+                                                    const msg = encodeURIComponent(`Hi ${item.name}, your pending balance at ${getCompanyInfo().companyName || "our shop"} is ${fmt(item.total)}. Please settle at your earliest convenience. Thank you! 🙏`);
                                                     window.open(`https://wa.me/${item.phone.replace(/\D/g, "")}?text=${msg}`, "_blank");
                                                 }} style={{ borderColor: T.border }}>💬</Btn>
                                             )}
@@ -771,7 +771,7 @@ export function ReportsPage({ movements, products, activeShopId, onPaymentReceip
                         <div style={{ marginTop: 24, display: "flex", gap: 12, flexWrap: "wrap" }}>
                             <Btn variant="amber" onClick={() => {
                                 const gstr1Json = {
-                                    gstin: "36AAXYZ1234X1ZP",
+                                    gstin: getCompanyInfo().gstin || "NOT_CONFIGURED",
                                     fp: new Date().toISOString().slice(0, 7).replace("-", "").slice(2),
                                     b2b: [],
                                     b2cs: [],

@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect } from "react";
 import { T, FONT, GLOBAL_CSS } from "./theme";
 import { fmt, uid, normalizeOrderStatus } from "./utils";
+import { getNextVoucherNumber } from "./voucherNumbering";
 import { useStore } from "./store";
 import { Toast, useToast, Btn, NotificationBell } from "./components/ui";
 
@@ -20,6 +21,8 @@ import VendorRFQPage from "./pages/VendorRFQPage";
 import AdminDashboard from "./pages/AdminDashboard";
 import StaffManagementPage from "./pages/StaffManagementPage";
 import { AccountingPage } from "./pages/AccountingPage";
+import { SettingsPage } from "./pages/SettingsPage";
+import { PurchaseEntryPage } from "./pages/PurchaseEntryPage";
 
 // Marketplace
 import { MarketplaceHome } from "./marketplace/pages/MarketplaceHome";
@@ -42,7 +45,9 @@ const NAV_ITEMS = [
   { key: "staff", icon: "👤", label: "Staff", shortcut: "T" },
   { key: "orders", icon: "◎", label: "Orders", shortcut: "O" },
   { key: "rfq", icon: "🤝", label: "RFQ / Procurement", shortcut: "Q" },
+  { key: "purchase", icon: "📥", label: "Purchase", shortcut: "U" },
   { key: "accounting", icon: "📒", label: "Accounting", shortcut: "C" },
+  { key: "settings", icon: "⚙️", label: "Settings", shortcut: "S" },
 ];
 
 export default function App() {
@@ -295,6 +300,45 @@ export default function App() {
     toast(`Stock added: +${data.qty} units · ${fmt(data.total)}`, "info", "Purchase Recorded");
   }, [products, movements, saveProducts, saveMovements, toast, activeShopId, logAudit]);
 
+  // ========== MULTI-ITEM PURCHASE HANDLER ==========
+  const handleMultiItemPurchase = useCallback((data) => {
+    const newMovements = [];
+    let updatedProducts = [...products];
+
+    data.items.forEach(item => {
+      updatedProducts = updatedProducts.map(p => p.id === item.productId ? {
+        ...p,
+        stock: p.stock + item.qty,
+        buyPrice: item.buyPrice,
+        sellPrice: item.newSellPrice || p.sellPrice,
+        supplier: data.vendorName || p.supplier,
+      } : p);
+
+      const isCredit = data.paymentMode === "Credit";
+
+      newMovements.push({
+        id: "m" + uid(), shopId: activeShopId, productId: item.productId, productName: item.name,
+        type: "PURCHASE", qty: item.qty, unitPrice: item.buyPrice, sellingPrice: item.newSellPrice || 0,
+        total: item.total, gstAmount: item.gstAmount, profit: null,
+        supplier: data.vendorName, supplierName: data.vendorName,
+        invoiceNo: data.voucherNo,
+        payment: data.paymentMode, paymentMode: data.paymentMode,
+        creditDays: data.creditDays || 0,
+        paymentStatus: isCredit ? "pending" : "paid",
+        note: [data.vendorName && `Supplier: ${data.vendorName}`, data.vendorInvoiceNo && `Vendor Inv: ${data.vendorInvoiceNo}`, isCredit && `Credit ${data.creditDays}d`, data.notes].filter(Boolean).join(" · ") || "Multi-item purchase",
+        date: data.date,
+        multiItemInvoice: true,
+        purchaseMeta: { vendorInvoiceNo: data.vendorInvoiceNo, vendorInvoiceDate: data.vendorInvoiceDate, poReference: data.poReference, warehouse: data.warehouse, hsn: item.hsn },
+      });
+    });
+
+    saveProducts(updatedProducts);
+    saveMovements([...movements, ...newMovements]);
+
+    logAudit("MULTI_PURCHASE_RECORDED", "movement", data.voucherNo, `${data.items.length} items · ${fmt(data.total)} from ${data.vendorName}`);
+    toast(`Purchase recorded: ${data.items.length} items · ${fmt(data.total)}`, "info", `Voucher ${data.voucherNo}`);
+  }, [products, movements, saveProducts, saveMovements, toast, activeShopId, logAudit]);
+
   // ========== ADJUSTMENT HANDLER ==========
   const handleAdjustment = useCallback((data) => {
     const sel = products.find(p => p.id === data.productId);
@@ -306,14 +350,16 @@ export default function App() {
     const movementType = data.adjustType;
     const lossAmount = (data.adjustType === "DAMAGE" || data.adjustType === "THEFT") ? (sel?.buyPrice || 0) * data.qty : 0;
 
+    const isCNDN = data.adjustType === "CREDIT_NOTE" || data.adjustType === "DEBIT_NOTE";
     saveMovements([...movements, {
       id: "m" + uid(), shopId: activeShopId, productId: data.productId, productName: sel?.name || "",
-      type: movementType, qty: data.qty, unitPrice: sel?.buyPrice || 0, sellingPrice: sel?.sellPrice || 0,
-      total: data.refundAmount || lossAmount || 0, gstAmount: 0,
-      profit: data.adjustType === "RETURN_IN" ? -(data.refundAmount || 0) : data.adjustType === "DAMAGE" || data.adjustType === "THEFT" ? -lossAmount : 0,
-      customerName: data.adjustType === "RETURN_IN" ? "Customer Return" : null,
+      type: movementType, qty: data.qty, unitPrice: isCNDN ? (data.refundAmount / (data.qty || 1)) : (sel?.buyPrice || 0), sellingPrice: sel?.sellPrice || 0,
+      total: data.refundAmount || lossAmount || 0, gstAmount: data.gstAmount || 0,
+      profit: data.adjustType === "RETURN_IN" ? -(data.refundAmount || 0) : data.adjustType === "CREDIT_NOTE" ? -(data.totalAmount || 0) : data.adjustType === "DAMAGE" || data.adjustType === "THEFT" ? -lossAmount : 0,
+      customerName: data.adjustType === "RETURN_IN" ? "Customer Return" : data.customerName || null,
       supplier: data.supplierName || null, supplierName: data.supplierName || null,
-      invoiceNo: data.originalInvoice || null,
+      invoiceNo: data.voucherNo || data.originalInvoice || null,
+      originalInvoice: data.originalInvoice || null,
       payment: data.refundMethod || data.adjustType, paymentStatus: "completed",
       note: [data.reason && `Reason: ${data.reason}`, data.reasonDetail, data.adjustType === "AUDIT" && `Audit: ${data.previousStock} → ${data.previousStock + stockChange}`, data.notes].filter(Boolean).join(" · ") || `Stock ${data.adjustType.toLowerCase()}`,
       date: data.date,
@@ -327,29 +373,44 @@ export default function App() {
 
   // ========== PAYMENT RECEIPT HANDLER (settle udhaar) ==========
   const handlePaymentReceipt = useCallback((data) => {
-    // Create a RECEIPT movement and update related movements
+    const voucherNo = getNextVoucherNumber("RECEIPT");
     const receiptMovement = {
       id: "m" + uid(), shopId: activeShopId, productId: null, productName: "",
       type: "RECEIPT", qty: 0, unitPrice: 0, sellingPrice: 0,
       total: data.amount, gstAmount: 0, profit: 0,
       customerName: data.partyName, customerPhone: data.partyPhone,
+      invoiceNo: voucherNo,
       payment: data.paymentMode, paymentMode: data.paymentMode, paymentStatus: "paid",
       note: `Payment received: ${fmt(data.amount)} from ${data.partyName} via ${data.paymentMode}. ${data.notes || ""}`.trim(),
       date: Date.now(),
+      allocations: data.allocations || [],
     };
 
-    // Mark pending movements as paid if movementIds provided, otherwise settle by customer name
-    let updatedMovements = movements.map(m => {
-      if (data.movementIds && data.movementIds.length > 0) {
-        if (data.movementIds.includes(m.id)) return { ...m, paymentStatus: "paid" };
-      } else if (m.customerName === data.partyName && m.paymentStatus === "pending") {
-        return { ...m, paymentStatus: "paid" };
-      }
-      return m;
-    });
+    let updatedMovements;
+    if (data.allocations && data.allocations.length > 0) {
+      const allocMap = {};
+      data.allocations.forEach(a => { allocMap[a.movementId] = a.amount; });
+      updatedMovements = movements.map(m => {
+        if (allocMap[m.id] !== undefined) {
+          const allocAmt = allocMap[m.id];
+          const newPaid = (m.paidAmount || 0) + allocAmt;
+          const total = m.total || 0;
+          const newStatus = newPaid >= total - 0.01 ? "paid" : "partial";
+          return { ...m, paidAmount: newPaid, paymentStatus: newStatus };
+        }
+        return m;
+      });
+    } else {
+      updatedMovements = movements.map(m => {
+        if ((m.customerName === data.partyName || m.supplierName === data.partyName || m.supplier === data.partyName) && (m.paymentStatus === "pending" || m.paymentStatus === "partial")) {
+          return { ...m, paymentStatus: "paid", paidAmount: m.total };
+        }
+        return m;
+      });
+    }
 
     saveMovements([...updatedMovements, receiptMovement]);
-    logAudit("RECEIPT_RECORDED", "receipt", data.partyName, `${fmt(data.amount)} via ${data.paymentMode}`);
+    logAudit("RECEIPT_RECORDED", "receipt", data.partyName, `${fmt(data.amount)} via ${data.paymentMode}${data.allocations?.length ? ` against ${data.allocations.length} bill(s)` : ""}`);
     toast(`Payment received: ${fmt(data.amount)} from ${data.partyName}`, "success", "Receipt Recorded");
   }, [movements, saveMovements, activeShopId, logAudit, toast]);
 
@@ -440,7 +501,9 @@ export default function App() {
     if (page === "staff") return <StaffManagementPage movements={movements} activeShopId={activeShopId} toast={toast} />;
     if (page === "orders") return <OrdersPage products={products} activeShopId={activeShopId} onSale={handleSale} toast={toast} orders={orders} saveOrders={saveOrders} movements={movements} saveMovements={saveMovements} />;
     if (page === "rfq") return <VendorRFQPage products={products} movements={movements} saveMovements={saveMovements} saveProducts={saveProducts} activeShopId={activeShopId} toast={toast} />;
+    if (page === "purchase") return <PurchaseEntryPage products={products} activeShopId={activeShopId} parties={parties} purchaseOrders={purchaseOrders} onMultiPurchase={handleMultiItemPurchase} toast={toast} />;
     if (page === "accounting") return <AccountingPage movements={movements} products={products} parties={parties} activeShopId={activeShopId} toast={toast} />;
+    if (page === "settings") return <SettingsPage toast={toast} />;
     if (page === "parties") return <PartiesPage parties={parties} movements={movements} vehicles={vehicles} activeShopId={activeShopId} onSaveParty={(p) => { const exists = (parties || []).find(x => x.id === p.id); saveParties(exists ? parties.map(x => x.id === p.id ? p : x) : [...(parties || []), p]); logAudit(exists ? "PARTY_UPDATED" : "PARTY_CREATED", "party", p.id, p.name); }} onSaveVehicle={(v) => { const exists = (vehicles || []).find(x => x.id === v.id); saveVehicles(exists ? vehicles.map(x => x.id === v.id ? v : x) : [...(vehicles || []), v]); }} onPaymentReceipt={handlePaymentReceipt} toast={toast} />;
     if (page === "workshop") return <WorkshopPage jobCards={jobCards} vehicles={vehicles} parties={parties} products={products} activeShopId={activeShopId} onSaveJobCard={(jc) => { const exists = (jobCards || []).find(x => x.id === jc.id); saveJobCards(exists ? jobCards.map(x => x.id === jc.id ? jc : x) : [...(jobCards || []), jc]); logAudit(exists ? "JOB_CARD_UPDATED" : "JOB_CARD_CREATED", "job_card", jc.id, `${jc.jobNumber} — ${jc.status}`); }} toast={toast} />;
   };

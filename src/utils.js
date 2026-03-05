@@ -8,6 +8,8 @@ export const EMOJIS = ["🔧", "⚙️", "🔩", "🛢️", "⚡", "🔋", "🌀
 
 export const uid = () => Math.random().toString(36).slice(2, 10);
 
+export const getCompanyInfo = () => { try { return JSON.parse(localStorage.getItem("vl_company")) || {}; } catch { return {}; } };
+
 // ===== MOVEMENT TYPE TAXONOMY =====
 export const MOVEMENT_TYPES = {
     PURCHASE: { label: "Purchase", icon: "📥", sym: "+", stockEffect: 1, revenueEffect: -1, color: T.sky, bg: T.skyBg },

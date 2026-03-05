@@ -1,6 +1,7 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import { T, FONT } from "../theme";
-import { fmt, fmtDateTime, uid, generateInvoiceNumber, margin } from "../utils";
+import { fmt, fmtDateTime, uid, margin, getCompanyInfo } from "../utils";
+import { getNextVoucherNumber } from "../voucherNumbering";
 import { Modal, Field, Input, Select, Divider, Btn } from "../components/ui";
 
 /**
@@ -16,9 +17,10 @@ import { Modal, Field, Input, Select, Divider, Btn } from "../components/ui";
  */
 export function POSBillingPage({ products, activeShopId, onMultiSale, toast }) {
     const shopProducts = useMemo(() => products.filter(p => p.shopId === activeShopId && p.isActive !== false), [products, activeShopId]);
+    const companyInfo = getCompanyInfo();
 
-    const [billType, setBillType] = useState("Sale"); // Sale | Quotation
-    const [items, setItems] = useState([]); // { productId, name, sku, image, qty, price, discount, discountType, gstRate, buyPrice, maxStock }
+    const [billType, setBillType] = useState("Sale");
+    const [items, setItems] = useState([]);
     const [search, setSearch] = useState("");
     const [customerName, setCustomerName] = useState("");
     const [customerPhone, setCustomerPhone] = useState("");
@@ -31,7 +33,53 @@ export function POSBillingPage({ products, activeShopId, onMultiSale, toast }) {
     const [invoiceNo, setInvoiceNo] = useState("");
     const searchRef = useRef(null);
 
-    // Auto-focus search on mount
+    const [heldInvoices, setHeldInvoices] = useState(() => {
+        try { return JSON.parse(localStorage.getItem("vl_held_invoices") || "[]"); } catch { return []; }
+    });
+    const [showHeldList, setShowHeldList] = useState(false);
+    const [showHelp, setShowHelp] = useState(false);
+
+    const persistHeld = useCallback((list) => {
+        setHeldInvoices(list);
+        localStorage.setItem("vl_held_invoices", JSON.stringify(list));
+    }, []);
+
+    const holdCurrentBill = useCallback(() => {
+        if (items.length === 0) { toast?.("Nothing to hold — add items first", "warning"); return; }
+        const held = {
+            id: uid(),
+            heldAt: Date.now(),
+            billType, items, customerName, customerPhone, vehicleReg, mechanic, notes, paymentMode,
+        };
+        persistHeld([...heldInvoices, held]);
+        toast?.(`Bill parked (${items.length} item${items.length > 1 ? "s" : ""} · ${customerName || "Walk-in"})`, "info", "Invoice Held");
+        setItems([]); setCustomerName(""); setCustomerPhone(""); setVehicleReg(""); setMechanic(""); setNotes("");
+        setPaymentMode("Cash"); setSearch("");
+        if (searchRef.current) searchRef.current.focus();
+    }, [items, billType, customerName, customerPhone, vehicleReg, mechanic, notes, paymentMode, heldInvoices, persistHeld, toast]);
+
+    const resumeHeldBill = useCallback((heldId) => {
+        const held = heldInvoices.find(h => h.id === heldId);
+        if (!held) return;
+        setBillType(held.billType);
+        setItems(held.items);
+        setCustomerName(held.customerName);
+        setCustomerPhone(held.customerPhone);
+        setVehicleReg(held.vehicleReg);
+        setMechanic(held.mechanic);
+        setNotes(held.notes);
+        setPaymentMode(held.paymentMode);
+        persistHeld(heldInvoices.filter(h => h.id !== heldId));
+        setShowHeldList(false);
+        toast?.("Held invoice resumed", "success");
+        if (searchRef.current) searchRef.current.focus();
+    }, [heldInvoices, persistHeld, toast]);
+
+    const removeHeldBill = useCallback((heldId) => {
+        persistHeld(heldInvoices.filter(h => h.id !== heldId));
+        toast?.("Held invoice discarded", "warning");
+    }, [heldInvoices, persistHeld, toast]);
+
     useEffect(() => { if (searchRef.current) searchRef.current.focus(); }, []);
 
     // Search results
@@ -96,13 +144,12 @@ export function POSBillingPage({ products, activeShopId, onMultiSale, toast }) {
         return true;
     };
 
-    // Submit
-    const handleSubmit = async () => {
+    const handleSubmit = useCallback(async () => {
         if (!validate()) return;
         setSaving(true);
         await new Promise(r => setTimeout(r, 300));
 
-        const inv = generateInvoiceNumber(billType === "Sale" ? "INV" : "EST");
+        const inv = getNextVoucherNumber(billType === "Sale" ? "SALE" : "ESTIMATE");
         setInvoiceNo(inv);
 
         const finalPayments = { [isUdhaar ? "Credit" : paymentMode]: grandTotal };
@@ -148,14 +195,31 @@ export function POSBillingPage({ products, activeShopId, onMultiSale, toast }) {
 
         setSaving(false);
         setShowInvoice(true);
-    };
+    }, [items, lineCalcs, billType, isUdhaar, paymentMode, grandTotal, grandSubtotal, grandDiscount, grandGst, grandProfit, customerName, customerPhone, vehicleReg, mechanic, notes, onMultiSale]);
 
-    // Reset for new bill
-    const newBill = () => {
+    const newBill = useCallback(() => {
         setItems([]); setCustomerName(""); setCustomerPhone(""); setVehicleReg(""); setMechanic(""); setNotes("");
-        setPaymentMode("Cash"); setShowInvoice(false); setSearch("");
+        setPaymentMode("Cash"); setShowInvoice(false); setSearch(""); setShowHeldList(false); setShowHelp(false);
         if (searchRef.current) searchRef.current.focus();
-    };
+    }, []);
+
+    useEffect(() => {
+        const handler = (e) => {
+            if (e.key === "F1") { e.preventDefault(); setShowHelp(prev => !prev); return; }
+            if (e.key === "Escape") {
+                if (showHelp) { setShowHelp(false); return; }
+                if (showHeldList) { setShowHeldList(false); return; }
+                if (search) { setSearch(""); return; }
+                if (items.length > 0) { newBill(); toast?.("Bill cleared", "info"); }
+                return;
+            }
+            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); if (!showInvoice) handleSubmit(); return; }
+            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "h") { e.preventDefault(); holdCurrentBill(); return; }
+            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "n") { e.preventDefault(); newBill(); toast?.("New bill started", "info"); return; }
+        };
+        window.addEventListener("keydown", handler);
+        return () => window.removeEventListener("keydown", handler);
+    }, [items, search, showInvoice, showHelp, showHeldList, newBill, holdCurrentBill, handleSubmit, toast]);
 
     // Invoice Preview
     if (showInvoice) return (
@@ -171,8 +235,9 @@ export function POSBillingPage({ products, activeShopId, onMultiSale, toast }) {
             {/* Thermal Receipt Style Invoice */}
             <div style={{ background: T.surface, border: `1px solid ${T.border}`, borderRadius: 14, padding: "20px 24px", fontFamily: FONT.ui }}>
                 <div style={{ textAlign: "center", paddingBottom: 14, borderBottom: `1px dashed ${T.border}`, marginBottom: 14 }}>
-                    <div style={{ fontSize: 18, fontWeight: 900, color: T.t1 }}>RAVI AUTO PARTS</div>
-                    <div style={{ fontSize: 11, color: T.t3, marginTop: 2 }}>14/A, Jubilee Hills, Hyderabad · GST: 36AAXYZ1234X1Z5</div>
+                    <div style={{ fontSize: 18, fontWeight: 900, color: T.t1 }}>{companyInfo.companyName || "AutoMobile Space"}</div>
+                    <div style={{ fontSize: 11, color: T.t3, marginTop: 2 }}>{[companyInfo.address, companyInfo.state].filter(Boolean).join(", ") || "Configure in Settings"}{companyInfo.gstin ? ` · GSTIN: ${companyInfo.gstin}` : ""}</div>
+                    {companyInfo.phone && <div style={{ fontSize: 11, color: T.t3, marginTop: 1 }}>Ph: {companyInfo.phone}{companyInfo.email ? ` · ${companyInfo.email}` : ""}</div>}
                     <div style={{ fontSize: 11, color: T.t3, marginTop: 2, fontFamily: FONT.mono }}>{invoiceNo} · {fmtDateTime(Date.now())}</div>
                     <div style={{ fontSize: 10, color: T.amber, fontWeight: 700, marginTop: 4 }}>{billType === "Sale" ? "TAX INVOICE" : "ESTIMATE / QUOTATION"}</div>
                 </div>
@@ -213,7 +278,7 @@ export function POSBillingPage({ products, activeShopId, onMultiSale, toast }) {
                 <Btn variant="ghost" full style={{ fontSize: 12 }} onClick={() => window.print()}>🖨 Print</Btn>
                 <Btn variant="ghost" full style={{ fontSize: 12 }} onClick={() => {
                     const itemsText = items.map((item, idx) => `${item.name}: ${item.qty} × ${fmt(item.price)} = ${fmt(lineCalcs[idx].afterDisc)}`).join("\n");
-                    const msg = encodeURIComponent(`📋 ${billType === "Sale" ? "Invoice" : "Quotation"} ${invoiceNo}\n\n${itemsText}\n\nTotal: ${fmt(grandTotal)}${grandDiscount > 0 ? `\nDiscount: -${fmt(grandDiscount)}` : ""}\n\nThank you for your business!\n— Ravi Auto Parts, Hyderabad`);
+                    const msg = encodeURIComponent(`📋 ${billType === "Sale" ? "Invoice" : "Quotation"} ${invoiceNo}\n\n${itemsText}\n\nTotal: ${fmt(grandTotal)}${grandDiscount > 0 ? `\nDiscount: -${fmt(grandDiscount)}` : ""}\n\nThank you for your business!\n— ${companyInfo.companyName || "AutoMobile Space"}`);
                     const phone = customerPhone ? customerPhone.replace(/\D/g, "") : "";
                     window.open(`https://wa.me/${phone}?text=${msg}`, "_blank");
                 }}>💬 WhatsApp</Btn>
@@ -224,20 +289,30 @@ export function POSBillingPage({ products, activeShopId, onMultiSale, toast }) {
 
     return (
         <div className="page-in" style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-            {/* Header */}
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                 <div>
                     <div style={{ fontSize: 20, fontWeight: 900, color: T.t1, letterSpacing: "-0.02em" }}>🧾 POS — Quick Billing</div>
                     <div style={{ fontSize: 12, color: T.t3, marginTop: 2 }}>Multi-item invoice with payment splitting</div>
                 </div>
-                <div style={{ display: "flex", gap: 8, background: T.surface, padding: 4, borderRadius: 10 }}>
-                    {["Sale", "Quotation"].map(t => (
-                        <button key={t} onClick={() => setBillType(t)} style={{
-                            padding: "8px 18px", borderRadius: 8, border: "none", fontWeight: 800, fontFamily: FONT.ui, fontSize: 13, cursor: "pointer", transition: "all 0.2s",
-                            background: billType === t ? (t === "Sale" ? T.amber : T.sky) : "transparent",
-                            color: billType === t ? "#000" : T.t3,
-                        }}>{t === "Sale" ? "🧾 Tax Invoice" : "📝 Quotation"}</button>
-                    ))}
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                    <button onClick={() => setShowHelp(true)} style={{ background: T.surface, border: `1px solid ${T.border}`, borderRadius: 8, padding: "6px 10px", cursor: "pointer", fontSize: 11, fontWeight: 700, color: T.t3, fontFamily: FONT.ui, display: "flex", alignItems: "center", gap: 4 }}>
+                        <span style={{ fontSize: 13 }}>⌨</span> F1
+                    </button>
+                    <button onClick={() => setShowHeldList(true)} style={{ position: "relative", background: T.surface, border: `1px solid ${heldInvoices.length > 0 ? T.amber + "66" : T.border}`, borderRadius: 8, padding: "6px 12px", cursor: "pointer", fontSize: 12, fontWeight: 700, color: heldInvoices.length > 0 ? T.amber : T.t3, fontFamily: FONT.ui, display: "flex", alignItems: "center", gap: 6 }}>
+                        ⏸ Held
+                        {heldInvoices.length > 0 && (
+                            <span style={{ background: T.amber, color: "#000", fontSize: 10, borderRadius: "50%", width: 18, height: 18, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 900 }}>{heldInvoices.length}</span>
+                        )}
+                    </button>
+                    <div style={{ display: "flex", gap: 4, background: T.surface, padding: 4, borderRadius: 10 }}>
+                        {["Sale", "Quotation"].map(t => (
+                            <button key={t} onClick={() => setBillType(t)} style={{
+                                padding: "8px 18px", borderRadius: 8, border: "none", fontWeight: 800, fontFamily: FONT.ui, fontSize: 13, cursor: "pointer", transition: "all 0.2s",
+                                background: billType === t ? (t === "Sale" ? T.amber : T.sky) : "transparent",
+                                color: billType === t ? "#000" : T.t3,
+                            }}>{t === "Sale" ? "🧾 Tax Invoice" : "📝 Quotation"}</button>
+                        ))}
+                    </div>
                 </div>
             </div>
 
@@ -420,16 +495,104 @@ export function POSBillingPage({ products, activeShopId, onMultiSale, toast }) {
                         </div>
                     </div>
 
-                    {/* Notes + Action */}
                     <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
                         <input value={notes} onChange={e => setNotes(e.target.value)} placeholder="Notes: warranty info, special instructions..."
                             style={{ flex: 1, padding: "10px 14px", background: T.surface, border: `1px solid ${T.border}`, borderRadius: 8, color: T.t1, fontFamily: FONT.ui, fontSize: 13 }} />
-                        <Btn variant="ghost" onClick={newBill}>Clear Bill</Btn>
-                        <Btn variant={billType === "Sale" ? "amber" : "sky"} loading={saving} onClick={handleSubmit} style={{ padding: "12px 28px" }}>
-                            {billType === "Sale" ? "🧾 Record Sale & Generate Bill" : "📝 Save Quotation"}
+                        <Btn variant="ghost" onClick={holdCurrentBill} style={{ whiteSpace: "nowrap" }}>⏸ Hold <span style={{ fontSize: 9, opacity: 0.6, marginLeft: 4 }}>Ctrl+H</span></Btn>
+                        <Btn variant="ghost" onClick={newBill}>Clear <span style={{ fontSize: 9, opacity: 0.6, marginLeft: 4 }}>Esc</span></Btn>
+                        <Btn variant={billType === "Sale" ? "amber" : "sky"} loading={saving} onClick={handleSubmit} style={{ padding: "12px 28px", whiteSpace: "nowrap" }}>
+                            {billType === "Sale" ? "🧾 Record Sale" : "📝 Save Quotation"} <span style={{ fontSize: 9, opacity: 0.7, marginLeft: 4 }}>Ctrl+S</span>
                         </Btn>
                     </div>
+
+                    <div style={{ display: "flex", gap: 16, justifyContent: "center", flexWrap: "wrap" }}>
+                        {[
+                            { keys: "Ctrl+S", label: "Save Bill" },
+                            { keys: "Ctrl+H", label: "Hold Bill" },
+                            { keys: "Ctrl+N", label: "New Bill" },
+                            { keys: "Esc", label: "Clear" },
+                            { keys: "F1", label: "Help" },
+                        ].map(s => (
+                            <div key={s.keys} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: T.t4 }}>
+                                <span style={{ background: T.surface, border: `1px solid ${T.border}`, borderRadius: 4, padding: "2px 6px", fontFamily: FONT.mono, fontSize: 10, fontWeight: 700, color: T.t3 }}>{s.keys}</span>
+                                {s.label}
+                            </div>
+                        ))}
+                    </div>
                 </>
+            )}
+
+            {showHelp && (
+                <div className="backdrop-in" onClick={() => setShowHelp(false)} style={{ position: "fixed", inset: 0, zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.6)", backdropFilter: "blur(4px)" }}>
+                    <div className="modal-in" onClick={e => e.stopPropagation()} style={{ background: T.card, border: `1px solid ${T.borderHi}`, borderRadius: 16, width: 420, padding: 24, boxShadow: "0 20px 50px rgba(0,0,0,0.5)" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+                            <div style={{ fontSize: 18, fontWeight: 900, color: T.t1 }}>⌨ Keyboard Shortcuts</div>
+                            <button onClick={() => setShowHelp(false)} style={{ background: "none", border: "none", color: T.t3, cursor: "pointer", fontSize: 20 }}>✕</button>
+                        </div>
+                        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                            {[
+                                { keys: "Ctrl + S", desc: "Save / Submit current bill", icon: "💾" },
+                                { keys: "Ctrl + H", desc: "Hold / Park current bill for later", icon: "⏸" },
+                                { keys: "Ctrl + N", desc: "Start a new empty bill", icon: "🆕" },
+                                { keys: "Escape", desc: "Clear search, close modals, or clear bill", icon: "✕" },
+                                { keys: "F1", desc: "Toggle this help overlay", icon: "❓" },
+                            ].map(s => (
+                                <div key={s.keys} style={{ display: "flex", alignItems: "center", gap: 14, padding: "10px 14px", background: T.surface, borderRadius: 10, border: `1px solid ${T.border}` }}>
+                                    <span style={{ fontSize: 18, width: 28, textAlign: "center" }}>{s.icon}</span>
+                                    <div style={{ flex: 1 }}>
+                                        <div style={{ fontSize: 13, fontWeight: 700, color: T.t1 }}>{s.desc}</div>
+                                    </div>
+                                    <span style={{ background: T.bg, border: `1px solid ${T.border}`, borderRadius: 6, padding: "4px 10px", fontFamily: FONT.mono, fontSize: 12, fontWeight: 800, color: T.amber }}>{s.keys}</span>
+                                </div>
+                            ))}
+                        </div>
+                        <div style={{ marginTop: 16, textAlign: "center", fontSize: 11, color: T.t4 }}>Press F1 or Escape to close</div>
+                    </div>
+                </div>
+            )}
+
+            {showHeldList && (
+                <div className="backdrop-in" onClick={() => setShowHeldList(false)} style={{ position: "fixed", inset: 0, zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.6)", backdropFilter: "blur(4px)" }}>
+                    <div className="modal-in" onClick={e => e.stopPropagation()} style={{ background: T.card, border: `1px solid ${T.borderHi}`, borderRadius: 16, width: 480, maxHeight: "70vh", padding: 24, boxShadow: "0 20px 50px rgba(0,0,0,0.5)", display: "flex", flexDirection: "column" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+                            <div style={{ fontSize: 18, fontWeight: 900, color: T.t1 }}>⏸ Held Invoices ({heldInvoices.length})</div>
+                            <button onClick={() => setShowHeldList(false)} style={{ background: "none", border: "none", color: T.t3, cursor: "pointer", fontSize: 20 }}>✕</button>
+                        </div>
+                        {heldInvoices.length === 0 ? (
+                            <div style={{ textAlign: "center", padding: "32px 20px", color: T.t3 }}>
+                                <div style={{ fontSize: 32, marginBottom: 8 }}>📋</div>
+                                <div style={{ fontSize: 14, fontWeight: 600 }}>No held invoices</div>
+                                <div style={{ fontSize: 12, marginTop: 4 }}>Use Ctrl+H to park a bill for later</div>
+                            </div>
+                        ) : (
+                            <div style={{ display: "flex", flexDirection: "column", gap: 10, overflowY: "auto", flex: 1 }}>
+                                {heldInvoices.map(h => {
+                                    const total = h.items.reduce((s, i) => {
+                                        const sub = i.price * i.qty;
+                                        const disc = i.discountType === "%" ? sub * i.discount / 100 : i.discount;
+                                        return s + sub - disc;
+                                    }, 0);
+                                    return (
+                                        <div key={h.id} style={{ background: T.surface, border: `1px solid ${T.border}`, borderRadius: 12, padding: "14px 16px", display: "flex", alignItems: "center", gap: 14 }}>
+                                            <div style={{ flex: 1 }}>
+                                                <div style={{ fontWeight: 700, fontSize: 14, color: T.t1, marginBottom: 4 }}>
+                                                    {h.customerName || "Walk-in"} <span style={{ fontSize: 11, color: T.t3, fontWeight: 500 }}>· {h.billType}</span>
+                                                </div>
+                                                <div style={{ fontSize: 12, color: T.t3 }}>
+                                                    {h.items.length} item{h.items.length > 1 ? "s" : ""} · {fmt(total)}
+                                                    {h.vehicleReg ? ` · ${h.vehicleReg}` : ""}
+                                                </div>
+                                                <div style={{ fontSize: 10, color: T.t4, marginTop: 2, fontFamily: FONT.mono }}>{fmtDateTime(h.heldAt)}</div>
+                                            </div>
+                                            <Btn variant="amber" size="sm" onClick={() => resumeHeldBill(h.id)}>Resume</Btn>
+                                            <button onClick={() => removeHeldBill(h.id)} style={{ background: "transparent", border: "none", color: T.crimson, cursor: "pointer", fontSize: 16, padding: 4 }}>✕</button>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        )}
+                    </div>
+                </div>
             )}
         </div>
     );

@@ -242,6 +242,61 @@ export function generateJournalEntries(movements, products, parties, activeShopI
         break;
       }
 
+      case "CREDIT_NOTE": {
+        const cnTotal = total;
+        const cnBase = cnTotal - gst;
+        const cogsAmount = (buyPrice || 0) * (m.qty || 0);
+
+        const journalRows = [
+          { accountCode: "AC020", accountName: "Sales Revenue", debit: cnBase > 0 ? cnBase : cnTotal, credit: 0 },
+        ];
+        if (gst > 0) {
+          journalRows.push({ accountCode: "AC011", accountName: "GST Output Tax", debit: gst, credit: 0 });
+        }
+        journalRows.push({ accountCode: "AC003", accountName: "Accounts Receivable", debit: 0, credit: cnTotal });
+        if (cogsAmount > 0) {
+          journalRows.push({ accountCode: "AC004", accountName: "Inventory", debit: cogsAmount, credit: 0 });
+          journalRows.push({ accountCode: "AC030", accountName: "Cost of Goods Sold", debit: 0, credit: cogsAmount });
+        }
+
+        entries.push({
+          id: "JE-" + m.id,
+          date: m.date,
+          voucherType: "Credit Note",
+          voucherNo: m.invoiceNo || "CN-" + m.id,
+          narration: `Credit Note: ${m.productName || "product"} — ${m.customerName || "customer"}${m.originalInvoice ? " (Ref: " + m.originalInvoice + ")" : ""}`,
+          entries: journalRows,
+          refId: m.id,
+          refType: "CREDIT_NOTE",
+        });
+        break;
+      }
+
+      case "DEBIT_NOTE": {
+        const dnTotal = total;
+        const dnBase = dnTotal - gst;
+
+        const journalRows = [
+          { accountCode: "AC010", accountName: "Accounts Payable", debit: dnTotal, credit: 0 },
+        ];
+        journalRows.push({ accountCode: "AC004", accountName: "Inventory", debit: 0, credit: dnBase > 0 ? dnBase : dnTotal });
+        if (gst > 0) {
+          journalRows.push({ accountCode: "AC005", accountName: "GST Input Credit", debit: 0, credit: gst });
+        }
+
+        entries.push({
+          id: "JE-" + m.id,
+          date: m.date,
+          voucherType: "Debit Note",
+          voucherNo: m.invoiceNo || "DN-" + m.id,
+          narration: `Debit Note: ${m.productName || "product"} — ${m.supplierName || m.supplier || "vendor"}${m.originalInvoice ? " (Ref: " + m.originalInvoice + ")" : ""}`,
+          entries: journalRows,
+          refId: m.id,
+          refType: "DEBIT_NOTE",
+        });
+        break;
+      }
+
       case "DAMAGE":
       case "THEFT":
       case "ADJUST":
@@ -297,6 +352,28 @@ export function generateJournalEntries(movements, products, parties, activeShopI
             });
           }
         }
+        break;
+      }
+
+      case "CONTRA": {
+        const fromAccCode = m.fromAccount || "AC001";
+        const toAccCode = m.toAccount || "AC002";
+        const fromAccName = getAccountName(fromAccCode);
+        const toAccName = getAccountName(toAccCode);
+
+        entries.push({
+          id: "JE-" + m.id,
+          date: m.date,
+          voucherType: "Contra",
+          voucherNo: m.invoiceNo || "CON-" + m.id,
+          narration: m.note || `Fund transfer from ${fromAccName} to ${toAccName}`,
+          entries: [
+            { accountCode: toAccCode, accountName: toAccName, debit: total, credit: 0 },
+            { accountCode: fromAccCode, accountName: fromAccName, debit: 0, credit: total },
+          ],
+          refId: m.id,
+          refType: "CONTRA",
+        });
         break;
       }
 

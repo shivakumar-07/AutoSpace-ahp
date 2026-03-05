@@ -560,7 +560,7 @@ export function InventoryPage({ products, movements, activeShopId, onAdd, onEdit
             </Modal>
 
             <PurchaseModal open={!!purchP} product={purchP} products={products} onClose={() => setPurchP(null)} onSave={(data) => onPurchase(data)} toast={toast} />
-            <StockAdjustmentModal open={!!adjP} product={adjP} products={products} onClose={() => setAdjP(null)} onSave={(data) => onAdjust(data)} toast={toast} />
+            <StockAdjustmentModal open={!!adjP} product={adjP} products={products} movements={movements} onClose={() => setAdjP(null)} onSave={(data) => onAdjust(data)} toast={toast} />
         </div>
     );
 }

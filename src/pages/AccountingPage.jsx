@@ -14,6 +14,7 @@ import {
   computeCostSheet,
   computeOutstandingAging,
 } from "../accounting";
+import { getNextVoucherNumber } from "../voucherNumbering";
 import {
   BarChart, Bar, PieChart, Pie, Cell, AreaChart, Area,
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend,
@@ -35,6 +36,7 @@ const TABS = [
 const VOUCHER_COLORS = {
   Sales: T.emerald, Purchase: T.sky, Receipt: T.amber, Payment: T.crimson,
   Journal: "#A78BFA", "Credit Note": T.crimson, "Debit Note": T.amber,
+  Contra: "#06B6D4", Reversal: "#F472B6",
 };
 
 const mono = { fontFamily: FONT.mono, fontVariantNumeric: "tabular-nums" };
@@ -85,6 +87,13 @@ export function AccountingPage({ movements, products, parties, activeShopId, toa
   const [mjRows, setMjRows] = useState([{ accountCode: "", debit: "", credit: "" }, { accountCode: "", debit: "", credit: "" }]);
   const [mjNarration, setMjNarration] = useState("");
   const [mjDate, setMjDate] = useState(toDateStr(Date.now()));
+  const [mjType, setMjType] = useState("Journal");
+  const [contraOpen, setContraOpen] = useState(false);
+  const [contraFrom, setContraFrom] = useState("AC001");
+  const [contraTo, setContraTo] = useState("AC002");
+  const [contraAmount, setContraAmount] = useState("");
+  const [contraNarration, setContraNarration] = useState("");
+  const [contraDate, setContraDate] = useState(toDateStr(Date.now()));
   const [customAccounts, setCustomAccounts] = useState(() => {
     try { return JSON.parse(localStorage.getItem("vl_custom_accounts") || "[]"); } catch { return []; }
   });
@@ -134,17 +143,26 @@ export function AccountingPage({ movements, products, parties, activeShopId, toa
     const validRows = mjRows.filter(r => r.accountCode && ((parseFloat(r.debit) || 0) > 0 || (parseFloat(r.credit) || 0) > 0));
     if (validRows.length < 2) { toast("At least 2 account entries required", "warning", "Validation Error"); return; }
 
+    const isContra = mjType === "Contra";
+    if (isContra) {
+      const cashBankCodes = ["AC001", "AC002"];
+      const allCashBank = validRows.every(r => cashBankCodes.includes(r.accountCode));
+      if (!allCashBank) { toast("Contra vouchers must only involve Cash/Bank accounts", "warning", "Validation Error"); return; }
+    }
+
+    const voucherNo = getNextVoucherNumber(isContra ? "CONTRA" : "JOURNAL", fromDateStr(mjDate));
+
     const entry = {
       id: "MJE-" + uid(),
       date: fromDateStr(mjDate) || Date.now(),
-      voucherType: "Journal",
-      voucherNo: "MJ-" + uid().slice(0, 6).toUpperCase(),
+      voucherType: isContra ? "Contra" : "Journal",
+      voucherNo,
       narration: mjNarration,
       entries: validRows.map(r => {
         const acc = allAccounts.find(a => a.code === r.accountCode);
         return { accountCode: r.accountCode, accountName: acc?.name || r.accountCode, debit: parseFloat(r.debit) || 0, credit: parseFloat(r.credit) || 0 };
       }),
-      refId: null, refType: "MANUAL",
+      refId: null, refType: isContra ? "CONTRA" : "MANUAL",
     };
     const next = [...manualJournals, entry];
     setManualJournals(next);
@@ -152,8 +170,66 @@ export function AccountingPage({ movements, products, parties, activeShopId, toa
     setManualJournalOpen(false);
     setMjRows([{ accountCode: "", debit: "", credit: "" }, { accountCode: "", debit: "", credit: "" }]);
     setMjNarration("");
-    toast("Manual journal entry saved", "success", "Journal Created");
-  }, [mjRows, mjNarration, mjDate, manualJournals, allAccounts, toast]);
+    setMjType("Journal");
+    toast(`${isContra ? "Contra" : "Journal"} entry ${voucherNo} saved`, "success", `${isContra ? "Contra" : "Journal"} Created`);
+  }, [mjRows, mjNarration, mjDate, mjType, manualJournals, allAccounts, toast]);
+
+  const saveContraVoucher = useCallback(() => {
+    const amt = parseFloat(contraAmount);
+    if (!amt || amt <= 0) { toast("Enter a valid amount", "warning", "Validation Error"); return; }
+    if (contraFrom === contraTo) { toast("From and To accounts must be different", "warning", "Validation Error"); return; }
+    if (!contraNarration.trim()) { toast("Narration is required", "warning", "Validation Error"); return; }
+
+    const fromAcc = allAccounts.find(a => a.code === contraFrom);
+    const toAcc = allAccounts.find(a => a.code === contraTo);
+    const voucherNo = getNextVoucherNumber("CONTRA", fromDateStr(contraDate));
+
+    const entry = {
+      id: "CON-" + uid(),
+      date: fromDateStr(contraDate) || Date.now(),
+      voucherType: "Contra",
+      voucherNo,
+      narration: contraNarration || `Fund transfer: ${fromAcc?.name || contraFrom} → ${toAcc?.name || contraTo}`,
+      entries: [
+        { accountCode: contraTo, accountName: toAcc?.name || contraTo, debit: amt, credit: 0 },
+        { accountCode: contraFrom, accountName: fromAcc?.name || contraFrom, debit: 0, credit: amt },
+      ],
+      refId: null, refType: "CONTRA",
+    };
+    const next = [...manualJournals, entry];
+    setManualJournals(next);
+    localStorage.setItem("vl_manual_journals", JSON.stringify(next));
+    setContraOpen(false);
+    setContraAmount("");
+    setContraNarration("");
+    setContraFrom("AC001");
+    setContraTo("AC002");
+    toast(`Contra voucher ${voucherNo} saved`, "success", "Fund Transfer Recorded");
+  }, [contraAmount, contraFrom, contraTo, contraNarration, contraDate, manualJournals, allAccounts, toast]);
+
+  const reverseEntry = useCallback((je) => {
+    const voucherNo = getNextVoucherNumber("JOURNAL", je.date);
+    const reversedEntries = je.entries.map(e => ({
+      accountCode: e.accountCode,
+      accountName: e.accountName,
+      debit: e.credit || 0,
+      credit: e.debit || 0,
+    }));
+
+    const entry = {
+      id: "REV-" + uid(),
+      date: Date.now(),
+      voucherType: "Reversal",
+      voucherNo,
+      narration: `Reversal of ${je.voucherNo}: ${je.narration}`,
+      entries: reversedEntries,
+      refId: je.id, refType: "REVERSAL",
+    };
+    const next = [...manualJournals, entry];
+    setManualJournals(next);
+    localStorage.setItem("vl_manual_journals", JSON.stringify(next));
+    toast(`Reversal entry ${voucherNo} created for ${je.voucherNo}`, "success", "Entry Reversed");
+  }, [manualJournals, toast]);
 
   const saveCustomAccount = useCallback(() => {
     if (!newAcc.name.trim()) { toast("Account name required", "warning"); return; }
@@ -265,7 +341,7 @@ export function AccountingPage({ movements, products, parties, activeShopId, toa
 
     const totalDr = filtered.reduce((s, je) => s + je.entries.reduce((ss, e) => ss + (e.debit || 0), 0), 0);
     const totalCr = filtered.reduce((s, je) => s + je.entries.reduce((ss, e) => ss + (e.credit || 0), 0), 0);
-    const voucherTypes = ["All", "Sales", "Purchase", "Receipt", "Payment", "Journal", "Credit Note", "Debit Note"];
+    const voucherTypes = ["All", "Sales", "Purchase", "Receipt", "Payment", "Journal", "Contra", "Reversal", "Credit Note", "Debit Note"];
 
     return (
       <div>
@@ -279,14 +355,58 @@ export function AccountingPage({ movements, products, parties, activeShopId, toa
             }}>{vt}</button>
           ))}
           <div style={{ flex: 1 }} />
+          <Btn size="sm" variant="ghost" onClick={() => setContraOpen(true)}>🔄 Contra Voucher</Btn>
           <Btn size="sm" variant="amber" onClick={() => setManualJournalOpen(true)}>＋ Manual Journal</Btn>
         </div>
 
+        {contraOpen && (
+          <div style={{ background: T.card, border: `1px solid #06B6D444`, borderRadius: 12, padding: 16, marginBottom: 16, borderLeft: `3px solid #06B6D4` }}>
+            <div style={{ fontSize: 14, fontWeight: 800, marginBottom: 12, color: "#06B6D4" }}>Contra Voucher — Fund Transfer</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 2fr", gap: 10, marginBottom: 12 }}>
+              <div>
+                <label style={{ fontSize: 9, color: T.t3, fontWeight: 700, textTransform: "uppercase", display: "block", marginBottom: 4 }}>Date</label>
+                <input type="date" value={contraDate} onChange={e => setContraDate(e.target.value)} style={inputStyle} />
+              </div>
+              <div>
+                <label style={{ fontSize: 9, color: T.t3, fontWeight: 700, textTransform: "uppercase", display: "block", marginBottom: 4 }}>From Account</label>
+                <select value={contraFrom} onChange={e => setContraFrom(e.target.value)} style={selectStyle}>
+                  {allAccounts.filter(a => ["AC001", "AC002"].includes(a.code)).map(a => <option key={a.code} value={a.code}>{a.name}</option>)}
+                </select>
+              </div>
+              <div>
+                <label style={{ fontSize: 9, color: T.t3, fontWeight: 700, textTransform: "uppercase", display: "block", marginBottom: 4 }}>To Account</label>
+                <select value={contraTo} onChange={e => setContraTo(e.target.value)} style={selectStyle}>
+                  {allAccounts.filter(a => ["AC001", "AC002"].includes(a.code)).map(a => <option key={a.code} value={a.code}>{a.name}</option>)}
+                </select>
+              </div>
+              <div>
+                <label style={{ fontSize: 9, color: T.t3, fontWeight: 700, textTransform: "uppercase", display: "block", marginBottom: 4 }}>Narration</label>
+                <input value={contraNarration} onChange={e => setContraNarration(e.target.value)} placeholder="e.g. Cash deposited to bank" style={inputStyle} />
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 10, alignItems: "flex-end" }}>
+              <div style={{ width: 180 }}>
+                <label style={{ fontSize: 9, color: T.t3, fontWeight: 700, textTransform: "uppercase", display: "block", marginBottom: 4 }}>Amount</label>
+                <input type="number" value={contraAmount} onChange={e => setContraAmount(e.target.value)} placeholder="0" style={{ ...inputStyle, ...mono, fontSize: 16, fontWeight: 700 }} />
+              </div>
+              <div style={{ flex: 1 }} />
+              <Btn size="sm" variant="ghost" onClick={() => setContraOpen(false)}>Cancel</Btn>
+              <Btn size="sm" variant="amber" onClick={saveContraVoucher}>Save Contra</Btn>
+            </div>
+          </div>
+        )}
+
         {manualJournalOpen && (
           <div style={{ background: T.card, border: `1px solid ${T.borderHi}`, borderRadius: 12, padding: 16, marginBottom: 16 }}>
-            <div style={{ fontSize: 14, fontWeight: 800, marginBottom: 12 }}>Create Manual Journal Entry</div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 2fr", gap: 10, marginBottom: 12 }}>
+            <div style={{ fontSize: 14, fontWeight: 800, marginBottom: 12 }}>Create Manual Entry</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 2fr", gap: 10, marginBottom: 12 }}>
               <div><label style={{ fontSize: 9, color: T.t3, fontWeight: 700, textTransform: "uppercase", display: "block", marginBottom: 4 }}>Date</label><input type="date" value={mjDate} onChange={e => setMjDate(e.target.value)} style={inputStyle} /></div>
+              <div><label style={{ fontSize: 9, color: T.t3, fontWeight: 700, textTransform: "uppercase", display: "block", marginBottom: 4 }}>Type</label>
+                <select value={mjType} onChange={e => setMjType(e.target.value)} style={selectStyle}>
+                  <option value="Journal">Journal</option>
+                  <option value="Contra">Contra (Cash/Bank only)</option>
+                </select>
+              </div>
               <div><label style={{ fontSize: 9, color: T.t3, fontWeight: 700, textTransform: "uppercase", display: "block", marginBottom: 4 }}>Narration</label><input value={mjNarration} onChange={e => setMjNarration(e.target.value)} placeholder="Description..." style={inputStyle} /></div>
             </div>
             <div style={{ marginBottom: 8 }}>
@@ -326,6 +446,11 @@ export function AccountingPage({ movements, products, parties, activeShopId, toa
                     <span style={{ fontSize: 11, color: T.t3 }}>{fmtDateTime(je.date)}</span>
                     <div style={{ flex: 1 }} />
                     {je.refId && <span style={{ ...mono, fontSize: 10, color: T.t4 }}>Ref: {je.refId}</span>}
+                    <button onClick={(e) => { e.stopPropagation(); reverseEntry(je); }} title="Reverse this entry" style={{
+                      background: "none", border: `1px solid ${T.border}`, borderRadius: 6, padding: "2px 8px",
+                      color: T.t3, fontSize: 10, cursor: "pointer", fontFamily: FONT.ui, fontWeight: 600,
+                      transition: "all 0.15s",
+                    }} className="btn-hover-subtle">↩ Reverse</button>
                   </div>
                   <div style={{ fontSize: 12, color: T.t2, marginBottom: 8 }}>{je.narration}</div>
                   <div style={{ borderRadius: 6, overflow: "hidden", border: `1px solid ${T.border}22` }}>

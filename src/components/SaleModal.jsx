@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { T, FONT } from "../theme";
-import { fmt, fmtDateTime } from "../utils";
+import { fmt, fmtDateTime, getCompanyInfo } from "../utils";
 import { Modal, Field, Input, Select, Divider, Btn } from "./ui";
 
 export function SaleModal({ open, onClose, product, products, onSave, toast }) {
@@ -129,8 +129,8 @@ export function SaleModal({ open, onClose, product, products, onSave, toast }) {
             {/* Mini Invoice */}
             <div style={{ background: T.surface, border: `1px solid ${T.border}`, borderRadius: 12, padding: "16px 18px", fontSize: 13, fontFamily: FONT.ui }}>
                 <div style={{ textAlign: "center", paddingBottom: 12, borderBottom: `1px dashed ${T.border}`, marginBottom: 12 }}>
-                    <div style={{ fontSize: 16, fontWeight: 800, color: T.t1 }}>RAVI AUTO PARTS</div>
-                    <div style={{ fontSize: 12, color: T.t3 }}>Hyderabad · GST: 36AAXXX1234X1Z5</div>
+                    <div style={{ fontSize: 16, fontWeight: 800, color: T.t1 }}>{getCompanyInfo().companyName || "AutoMobile Space"}</div>
+                    <div style={{ fontSize: 12, color: T.t3 }}>{`${getCompanyInfo().state || "Location"} · GSTIN: ${getCompanyInfo().gstin || "Configure in Settings"}`}</div>
                     <div style={{ fontSize: 12, color: T.t3, marginTop: 2, fontFamily: FONT.mono }}>{invoiceNo} · {fmtDateTime(now.current)}</div>
                 </div>
                 {f.customerName && <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}><span style={{ color: T.t3 }}>Customer</span><span style={{ fontWeight: 600 }}>{f.customerName}</span></div>}
@@ -155,7 +155,7 @@ export function SaleModal({ open, onClose, product, products, onSave, toast }) {
             <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
                 <Btn variant="ghost" full style={{ fontSize: 12 }} onClick={() => window.print()}>🖨 Print</Btn>
                 <Btn variant="ghost" full style={{ fontSize: 12 }} onClick={() => {
-                    const msg = encodeURIComponent(`📋 ${f.type === "Quotation" ? "Quotation" : "Invoice"} ${invoiceNo}\n\nProduct: ${sel.name}\nQty: ${qty} × ${fmt(sellPrice)} = ${fmt(totalAfterDisc)}${discAmt > 0 ? `\nDiscount: -${fmt(discAmt)}` : ""}\n\nThank you for your business!\n— Ravi Auto Parts, Hyderabad`);
+                    const msg = encodeURIComponent(`📋 ${f.type === "Quotation" ? "Quotation" : "Invoice"} ${invoiceNo}\n\nProduct: ${sel.name}\nQty: ${qty} × ${fmt(sellPrice)} = ${fmt(totalAfterDisc)}${discAmt > 0 ? `\nDiscount: -${fmt(discAmt)}` : ""}\n\nThank you for your business!\n— ${getCompanyInfo().companyName || "AutoMobile Space"}`);
                     const phone = f.customerPhone ? f.customerPhone.replace(/\D/g, "") : "";
                     window.open(`https://wa.me/${phone}?text=${msg}`, "_blank");
                 }}>💬 WhatsApp</Btn>

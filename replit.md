@@ -38,20 +38,25 @@ Two integrated modes:
 - `vl_garage` — customer saved vehicles
 - `vl_reminders` — vehicle service reminders
 - `vl_announcements` — admin broadcast messages
+- `vl_company` — company profile/settings (GSTIN, PAN, address, financial year)
+- `vl_voucher_sequences` — auto-sequential voucher numbering per type per financial year
 
 ## Project Structure
 ```
 src/
-├── pages/                      # ERP pages
+├── pages/
 │   ├── DashboardPage.jsx       # KPIs, dead stock, alerts, charts
 │   ├── InventoryPage.jsx       # Stock management, movements ledger
-│   ├── POSBillingPage.jsx      # Point-of-sale billing, GST
-│   ├── PartiesPage.jsx         # Udhaar ledger, aging, WhatsApp
+│   ├── POSBillingPage.jsx      # Point-of-sale billing, GST, hold/park invoices, keyboard shortcuts
+│   ├── PartiesPage.jsx         # Udhaar ledger, aging, WhatsApp, bill-by-bill payment allocation
 │   ├── OrdersPage.jsx          # Marketplace order management
 │   ├── HistoryPage.jsx         # Sales history, invoice history
 │   ├── ReportsPage.jsx         # GSTR-1, GSTR-3B, Day Book, ITC, Stock Valuation
 │   ├── WorkshopPage.jsx        # Job cards, workshop management
 │   ├── VendorRFQPage.jsx       # B2B procurement, RFQ, vendor bidding, POs
+│   ├── PurchaseEntryPage.jsx   # Multi-item purchase bills, vendor invoice tracking, 3-way match
+│   ├── SettingsPage.jsx        # Company profile, GSTIN, PAN, financial year config
+│   ├── AccountingPage.jsx      # Full double-entry bookkeeping (Tally/SAP style)
 │   ├── AdminDashboard.jsx      # Platform admin (5-click logo to access)
 │   └── PricingPage.jsx         # SaaS pricing plans
 ├── marketplace/
@@ -82,6 +87,8 @@ src/
 ├── store.js                    # All localStorage state management
 ├── theme.js                    # Design tokens + global CSS
 ├── utils.js                    # Business logic helpers
+├── accounting.js               # Double-entry bookkeeping engine
+├── voucherNumbering.js         # Auto-sequential voucher numbering system
 └── vehicleData.js              # Make/model/year/variant data
 ```
 
@@ -91,6 +98,7 @@ src/
 - **Order SLA**: Accept within 5 min to maintain marketplace rankings; countdown timer on orders
 - **Dead Stock**: Items with 0 sales in 180+ days flagged for flash sale suggestion
 - **GST**: CGST+SGST for intra-state; IGST for inter-state
+- **Voucher Numbering**: PREFIX/FY/SEQ format (e.g., INV/2526/001), auto-incremented per financial year
 
 ## Features Implemented
 
@@ -103,12 +111,21 @@ src/
 - Inventory with stock movements ledger, barcode labels, PO generation
 - **Smart Filter in Inventory**: Sales velocity (Fast/Slow/Dead), price range, category, stock status
 - POS Billing (fast invoice, GST, multiple payment modes)
+- **POS Keyboard Shortcuts**: Ctrl+S (save), Ctrl+H (hold), Ctrl+N (new), Esc (clear), F1 (help)
+- **Hold/Park Invoice**: Save current bill, resume later, held invoice list with badge
+- **Bill-by-Bill Payment Allocation**: Select specific invoices to allocate payments, FIFO auto-allocate
 - Parties / Udhaar with aging visualization, WhatsApp deep-links
 - Orders management with 5-min accept timer, countdown
 - **Return & Refund Management**: Full return lifecycle — approve/reject, RETURN_IN stock movement, refund processing
 - Reports: GSTR-1, GSTR-3B, Day Book, ITC Register, Stock Valuation
 - Workshop / Job Cards
 - **B2B Vendor RFQ System**: Create RFQs, vendor bids, bid ranking, PO generation, inventory receipt
+- **Multi-Item Purchase Entry**: Full purchase bill with vendor invoice tracking, HSN codes, PO auto-fill, 3-way match
+- **Credit Note & Debit Note Flows**: Link to original invoice, proper stock + accounting reversal
+- **Contra Voucher**: Fund transfers between cash/bank accounts
+- **Document Reversal**: Create equal and opposite journal entry for any voucher
+- **Company Settings**: Company profile, GSTIN, PAN, State, Address, financial year config
+- **Voucher Auto-Numbering**: Sequential numbers per type per FY (INV/PUR/RCP/PAY/JNL/CN/DN/CON)
 - **Staff Management**: Roles (MANAGER/CASHIER/MECHANIC/WAREHOUSE), permissions matrix, activity tracking, PIN-based login
 - **Admin Dashboard**: Platform GMV, shop management, dispute queue (5-click logo access)
 - **Accounting & Finance** (Tally-style): Full double-entry bookkeeping system with 10 tabs:
@@ -122,7 +139,7 @@ src/
   - Cost Sheet (cascading cost breakdown: Materials → Prime Cost → Works Cost → Total Cost)
   - Outstanding Aging (Receivables & Payables with 0-30/31-60/61-90/90+ day buckets, WhatsApp reminders)
   - Financial Ratios (Current Ratio, Quick Ratio, Margins, Turnover, ROA, Debt/Equity, Health Score)
-  - Engine: `src/accounting.js` (820 lines), UI: `src/pages/AccountingPage.jsx` (1033 lines)
+  - Engine: `src/accounting.js`, UI: `src/pages/AccountingPage.jsx`
 
 ### Marketplace Side
 - Hero with animated gear, trust badges, category grid
@@ -137,7 +154,8 @@ src/
 
 ### Cross-Platform
 - **Live Notification Bell**: Auto-generates notifications for new orders, low stock, payment due, RFQ bids. Mark read, clear, preferences toggle.
-- **Architecture Document**: Full spec stored in `amp_details.md` (1793 lines)
+- **Architecture Document**: Full spec stored in `amp_details.md`
+- **Dynamic Company Branding**: All invoices, WhatsApp messages, and GST reports use company settings from `vl_company`
 
 ## Development Setup
 - Run: `npm run dev` on port 5000

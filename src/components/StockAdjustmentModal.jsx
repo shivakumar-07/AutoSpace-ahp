@@ -1,13 +1,14 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import { T, FONT } from "../theme";
 import { fmt, fmtDate } from "../utils";
 import { Modal, Field, Input, Select, Divider, Btn } from "./ui";
+import { getNextVoucherNumber, peekNextVoucherNumber } from "../voucherNumbering";
 
 const ADJUSTMENT_TYPES = [
     { value: "RETURN_IN", label: "↩️ Customer Return", desc: "Customer returns product — stock increases, refund/credit issued", stockDir: 1, icon: "↩️" },
     { value: "RETURN_OUT", label: "📤 Return to Vendor", desc: "Return product to supplier — stock decreases, credit expected", stockDir: -1, icon: "📤" },
-    { value: "CREDIT_NOTE", label: "📝 Credit Note", desc: "Issue credit note to customer — price adjustment without stock change", stockDir: 0, icon: "📝" },
-    { value: "DEBIT_NOTE", label: "📋 Debit Note", desc: "Issue debit note to supplier — claim for damaged/short goods", stockDir: 0, icon: "📋" },
+    { value: "CREDIT_NOTE", label: "📝 Credit Note", desc: "Sales return — return items to stock, reverse revenue + GST", stockDir: 1, icon: "📝" },
+    { value: "DEBIT_NOTE", label: "📋 Debit Note", desc: "Purchase return — reduce stock & payable, reverse expense + GST", stockDir: -1, icon: "📋" },
     { value: "DAMAGE", label: "💥 Damaged Goods", desc: "Products damaged in storage/transit — write off as loss", stockDir: -1, icon: "💥" },
     { value: "THEFT", label: "🚨 Theft / Shrinkage", desc: "Unaccounted loss — reported for audit", stockDir: -1, icon: "🚨" },
     { value: "AUDIT", label: "📊 Audit Correction", desc: "Physical count mismatch — adjust to match real count", stockDir: 0, icon: "📊" },
@@ -30,7 +31,7 @@ const RETURN_REASONS = [
     { value: "other", label: "Other" },
 ];
 
-export function StockAdjustmentModal({ open, onClose, product, products, onSave, toast }) {
+export function StockAdjustmentModal({ open, onClose, product, products, movements, onSave, toast }) {
     const blank = {
         adjustType: "RETURN_IN",
         productId: product?.id || "",
@@ -70,7 +71,39 @@ export function StockAdjustmentModal({ open, onClose, product, products, onSave,
     const refundAmt = +f.refundAmount || 0;
     const totalRefund = refundAmt * qty;
 
-    // For audit: calculate the difference
+    const isCreditNote = f.adjustType === "CREDIT_NOTE";
+    const isDebitNote = f.adjustType === "DEBIT_NOTE";
+    const isCNDN = isCreditNote || isDebitNote;
+
+    const gstRate = sel?.gstRate || 18;
+    const noteAmount = isCNDN ? totalRefund : 0;
+    const noteBaseAmount = isCNDN ? Math.round((noteAmount * 100) / (100 + gstRate)) : 0;
+    const noteGstAmount = isCNDN ? noteAmount - noteBaseAmount : 0;
+
+    const voucherPreview = isCreditNote
+        ? peekNextVoucherNumber("CREDIT_NOTE")
+        : isDebitNote
+            ? peekNextVoucherNumber("DEBIT_NOTE")
+            : null;
+
+    const saleInvoices = useMemo(() => {
+        if (!movements) return [];
+        return movements.filter(m => m.type === "SALE" && m.shopId === (product?.shopId || "")).map(m => ({
+            value: m.invoiceNo || m.id,
+            label: `${m.invoiceNo || m.id} — ${m.productName || ""} (${fmtDate(m.date)})`,
+            movement: m,
+        }));
+    }, [movements, product?.shopId]);
+
+    const purchaseInvoices = useMemo(() => {
+        if (!movements) return [];
+        return movements.filter(m => m.type === "PURCHASE" && m.shopId === (product?.shopId || "")).map(m => ({
+            value: m.invoiceNo || m.id,
+            label: `${m.invoiceNo || m.id} — ${m.productName || ""} (${fmtDate(m.date)})`,
+            movement: m,
+        }));
+    }, [movements, product?.shopId]);
+
     const actualCount = +f.actualCount || 0;
     const auditDiff = f.adjustType === "AUDIT" ? actualCount - (sel?.stock || 0) : 0;
 
@@ -87,6 +120,9 @@ export function StockAdjustmentModal({ open, onClose, product, products, onSave,
         }
         if (f.adjustType === "RETURN_IN" && !f.reason) e.reason = "Select return reason";
         if (f.adjustType === "RETURN_OUT" && !f.supplierName) e.supplierName = "Enter supplier name";
+        if (isCNDN && !f.supplierName) e.supplierName = isCreditNote ? "Enter customer name" : "Enter supplier name";
+        if (isCNDN && (!f.refundAmount || refundAmt <= 0)) e.refundAmount = "Enter note amount";
+        if (isCNDN && !f.originalInvoice) e.originalInvoice = "Link to original invoice/bill";
         setErrors(e);
         return Object.keys(e).length === 0;
     };
@@ -99,15 +135,21 @@ export function StockAdjustmentModal({ open, onClose, product, products, onSave,
         const finalQty = f.adjustType === "AUDIT" ? Math.abs(auditDiff) : qty;
         const finalDir = f.adjustType === "AUDIT" ? (auditDiff >= 0 ? 1 : -1) : adjType.stockDir;
 
+        const voucherNo = isCreditNote
+            ? getNextVoucherNumber("CREDIT_NOTE")
+            : isDebitNote
+                ? getNextVoucherNumber("DEBIT_NOTE")
+                : null;
+
         onSave({
             adjustType: f.adjustType,
             productId: f.productId,
             qty: finalQty,
-            stockDirection: finalDir, // +1 = add, -1 = deduct
+            stockDirection: finalDir,
             reason: f.reason || f.adjustType,
             reasonDetail: f.reasonDetail,
             refundMethod: f.adjustType === "RETURN_IN" ? f.refundMethod : null,
-            refundAmount: f.adjustType === "RETURN_IN" ? totalRefund : 0,
+            refundAmount: f.adjustType === "RETURN_IN" ? totalRefund : isCNDN ? noteAmount : 0,
             supplierName: f.supplierName,
             originalInvoice: f.originalInvoice,
             auditDiff: f.adjustType === "AUDIT" ? auditDiff : null,
@@ -115,6 +157,14 @@ export function StockAdjustmentModal({ open, onClose, product, products, onSave,
             previousStock: sel?.stock || 0,
             notes: f.notes,
             date: now.current,
+            ...(isCNDN && {
+                voucherNo,
+                gstRate,
+                gstAmount: noteGstAmount,
+                baseAmount: noteBaseAmount,
+                totalAmount: noteAmount,
+                customerName: isCreditNote ? f.supplierName : null,
+            }),
         });
         setSaving(false);
         onClose();
@@ -245,20 +295,72 @@ export function StockAdjustmentModal({ open, onClose, product, products, onSave,
                 )}
 
                 {/* CREDIT_NOTE / DEBIT_NOTE */}
-                {(f.adjustType === "CREDIT_NOTE" || f.adjustType === "DEBIT_NOTE") && (
+                {isCNDN && (
                     <>
-                        <Field label={f.adjustType === "CREDIT_NOTE" ? "Customer Name" : "Supplier Name"} required error={errors.supplierName}>
-                            <Input value={f.supplierName} onChange={set("supplierName")} placeholder={f.adjustType === "CREDIT_NOTE" ? "Customer name" : "Supplier name"} icon={f.adjustType === "CREDIT_NOTE" ? "👤" : "🏭"} />
+                        {voucherPreview && (
+                            <div style={{ gridColumn: "span 2", marginBottom: 4 }}>
+                                <div style={{
+                                    background: `${T.violet}15`, border: `1px solid ${T.violet}33`, borderRadius: 10,
+                                    padding: "10px 16px", display: "flex", justifyContent: "space-between", alignItems: "center"
+                                }}>
+                                    <span style={{ fontSize: 12, color: T.t3, fontWeight: 700 }}>Voucher No.</span>
+                                    <span style={{ fontSize: 14, fontWeight: 800, fontFamily: FONT.mono, color: T.violet }}>{voucherPreview}</span>
+                                </div>
+                            </div>
+                        )}
+                        <Field label={isCreditNote ? "Customer Name" : "Supplier Name"} required error={errors.supplierName}>
+                            <Input value={f.supplierName} onChange={set("supplierName")} placeholder={isCreditNote ? "Customer name" : "Supplier name"} icon={isCreditNote ? "👤" : "🏭"} />
                         </Field>
-                        <Field label="Original Invoice / Bill No.">
-                            <Input value={f.originalInvoice} onChange={set("originalInvoice")} placeholder="INV-12345 or PINV-12345" icon="🧾" />
+                        <Field label={isCreditNote ? "Original Sale Invoice" : "Original Purchase Bill"} required error={errors.originalInvoice}>
+                            <Select value={f.originalInvoice} onChange={v => {
+                                const invoices = isCreditNote ? saleInvoices : purchaseInvoices;
+                                const inv = invoices.find(i => i.value === v);
+                                if (inv?.movement) {
+                                    setF(prev => ({
+                                        ...prev,
+                                        originalInvoice: v,
+                                        supplierName: isCreditNote ? (inv.movement.customerName || prev.supplierName) : (inv.movement.supplierName || inv.movement.supplier || prev.supplierName),
+                                        refundAmount: String(inv.movement.unitPrice || inv.movement.sellingPrice || ""),
+                                        qty: String(inv.movement.qty || 1),
+                                    }));
+                                } else {
+                                    set("originalInvoice")(v);
+                                }
+                            }} options={[
+                                { value: "", label: isCreditNote ? "— Select sale invoice —" : "— Select purchase bill —" },
+                                ...(isCreditNote ? saleInvoices : purchaseInvoices)
+                            ]} />
                         </Field>
-                        <Field label="Note Amount (₹)" required error={errors.refundAmount}>
+                        <Field label="Rate per Unit (₹)" required error={errors.refundAmount}>
                             <Input type="number" value={f.refundAmount} onChange={set("refundAmount")} prefix="₹" placeholder="0" />
                         </Field>
                         <Field label="Reason">
-                            <Input value={f.reasonDetail} onChange={set("reasonDetail")} placeholder={f.adjustType === "CREDIT_NOTE" ? "Price difference, return credit" : "Short shipment, quality issue"} />
+                            <Input value={f.reasonDetail} onChange={set("reasonDetail")} placeholder={isCreditNote ? "Sales return, price adjustment" : "Short shipment, quality issue"} />
                         </Field>
+                        {noteAmount > 0 && (
+                            <div style={{ gridColumn: "span 2" }}>
+                                <div style={{
+                                    background: T.surface, border: `1px solid ${T.border}`, borderRadius: 10,
+                                    padding: "12px 16px"
+                                }}>
+                                    <div style={{ fontSize: 11, color: T.t3, fontWeight: 700, textTransform: "uppercase", marginBottom: 8 }}>
+                                        {isCreditNote ? "Credit" : "Debit"} Note Breakdown
+                                    </div>
+                                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                                        <span style={{ fontSize: 13, color: T.t2 }}>Base Amount ({qty} × {fmt(refundAmt)})</span>
+                                        <span style={{ fontSize: 13, fontFamily: FONT.mono, color: T.t1 }}>{fmt(noteBaseAmount)}</span>
+                                    </div>
+                                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                                        <span style={{ fontSize: 13, color: T.t2 }}>GST @ {gstRate}%</span>
+                                        <span style={{ fontSize: 13, fontFamily: FONT.mono, color: T.amber }}>{fmt(noteGstAmount)}</span>
+                                    </div>
+                                    <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 6, marginTop: 4, display: "flex", justifyContent: "space-between" }}>
+                                        <span style={{ fontSize: 14, fontWeight: 800, color: T.t1 }}>Total</span>
+                                        <span style={{ fontSize: 16, fontWeight: 900, fontFamily: FONT.mono, color: isCreditNote ? T.crimson : T.emerald }}>{fmt(noteAmount)}</span>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
                     </>
                 )}
 
@@ -338,7 +440,7 @@ export function StockAdjustmentModal({ open, onClose, product, products, onSave,
                     variant={f.adjustType === "RETURN_IN" ? "emerald" : f.adjustType === "DAMAGE" || f.adjustType === "THEFT" ? "danger" : "sky"}
                     loading={saving} onClick={handleSave}
                 >
-                    {adjType?.icon} {f.adjustType === "AUDIT" ? "Apply Correction" : f.adjustType === "RETURN_IN" ? "Process Return" : f.adjustType === "RETURN_OUT" ? "Return to Vendor" : "Record Adjustment"}
+                    {adjType?.icon} {f.adjustType === "AUDIT" ? "Apply Correction" : f.adjustType === "RETURN_IN" ? "Process Return" : f.adjustType === "RETURN_OUT" ? "Return to Vendor" : f.adjustType === "CREDIT_NOTE" ? "Issue Credit Note" : f.adjustType === "DEBIT_NOTE" ? "Issue Debit Note" : "Record Adjustment"}
                 </Btn>
             </div>
         </Modal>

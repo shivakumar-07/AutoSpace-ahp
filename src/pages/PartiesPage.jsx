@@ -13,6 +13,8 @@ export function PartiesPage({ parties, movements, vehicles, activeShopId, onSave
     const [receiptAmount, setReceiptAmount] = useState("");
     const [receiptMode, setReceiptMode] = useState("Cash");
     const [receiptNotes, setReceiptNotes] = useState("");
+    const [allocMode, setAllocMode] = useState("fifo");
+    const [billAllocations, setBillAllocations] = useState({});
 
     const shopParties = useMemo(() => (parties || []).filter(p => p.shopId === activeShopId), [parties, activeShopId]);
     const shopVehicles = useMemo(() => (vehicles || []).filter(v => v.shopId === activeShopId), [vehicles, activeShopId]);
@@ -30,12 +32,16 @@ export function PartiesPage({ parties, movements, vehicles, activeShopId, onSave
         let balance = party.openingBalance || 0;
         shopMovements.forEach(m => {
             if (party.type === "customer" || party.type === "both") {
-                if (m.customerName === party.name && m.type === "SALE" && (m.paymentStatus === "pending" || m.paymentMode === "Credit")) balance += m.total;
-                if (m.type === "RECEIPT" && m.customerName === party.name) balance -= m.total;
+                if (m.customerName === party.name && m.type === "SALE" && (m.paymentStatus === "pending" || m.paymentStatus === "partial")) {
+                    balance += (m.total || 0) - (m.paidAmount || 0);
+                }
+                if (m.type === "RECEIPT" && m.customerName === party.name && !m.allocations?.length) balance -= m.total;
             }
             if (party.type === "supplier" || party.type === "both") {
-                if ((m.supplierName === party.name || m.supplier === party.name) && m.type === "PURCHASE" && (m.paymentStatus === "pending" || m.paymentMode === "Credit")) balance += m.total;
-                if (m.type === "PAYMENT" && m.supplierName === party.name) balance -= m.total;
+                if ((m.supplierName === party.name || m.supplier === party.name) && m.type === "PURCHASE" && (m.paymentStatus === "pending" || m.paymentStatus === "partial")) {
+                    balance += (m.total || 0) - (m.paidAmount || 0);
+                }
+                if (m.type === "PAYMENT" && m.supplierName === party.name && !m.allocations?.length) balance -= m.total;
             }
         });
         return balance;
@@ -86,22 +92,107 @@ export function PartiesPage({ parties, movements, vehicles, activeShopId, onSave
         toast?.("Party list exported!", "success");
     };
 
+    const getOutstandingBills = (party) => {
+        const isCustomer = party.type === "customer" || party.type === "both";
+        const isSupplier = party.type === "supplier" || party.type === "both";
+        return shopMovements
+            .filter(m => {
+                if (isCustomer && view === "customers" && m.customerName === party.name && m.type === "SALE" && (m.paymentStatus === "pending" || m.paymentStatus === "partial")) return true;
+                if (isSupplier && view === "suppliers" && (m.supplierName === party.name || m.supplier === party.name) && m.type === "PURCHASE" && (m.paymentStatus === "pending" || m.paymentStatus === "partial")) return true;
+                return false;
+            })
+            .sort((a, b) => a.date - b.date)
+            .map(m => ({
+                ...m,
+                billOutstanding: (m.total || 0) - (m.paidAmount || 0),
+            }));
+    };
+
+    const doFifoAllocation = (bills, totalAmount) => {
+        const allocs = {};
+        let remaining = totalAmount;
+        for (const bill of bills) {
+            if (remaining <= 0) break;
+            const allocAmt = Math.min(remaining, bill.billOutstanding);
+            if (allocAmt > 0) {
+                allocs[bill.id] = allocAmt;
+                remaining -= allocAmt;
+            }
+        }
+        return allocs;
+    };
+
+    const handleOpenReceiptModal = (party) => {
+        setReceiptModal(party);
+        const bal = getBalance(party);
+        setReceiptAmount(String(bal));
+        setAllocMode("fifo");
+        const bills = getOutstandingBills(party);
+        setBillAllocations(doFifoAllocation(bills, bal));
+    };
+
+    const handleAllocAmountChange = (billId, value) => {
+        setAllocMode("manual");
+        setBillAllocations(prev => {
+            const next = { ...prev };
+            const amt = parseFloat(value) || 0;
+            if (amt <= 0) {
+                delete next[billId];
+            } else {
+                next[billId] = amt;
+            }
+            return next;
+        });
+    };
+
+    const handleToggleBill = (bill) => {
+        setAllocMode("manual");
+        setBillAllocations(prev => {
+            const next = { ...prev };
+            if (next[bill.id]) {
+                delete next[bill.id];
+            } else {
+                const totalAllocated = Object.values(next).reduce((s, v) => s + v, 0);
+                const receiptAmt = parseFloat(receiptAmount) || 0;
+                const remaining = receiptAmt - totalAllocated;
+                next[bill.id] = Math.min(remaining > 0 ? remaining : bill.billOutstanding, bill.billOutstanding);
+            }
+            return next;
+        });
+    };
+
+    useEffect(() => {
+        if (receiptModal && allocMode === "fifo") {
+            const bills = getOutstandingBills(receiptModal);
+            const amt = parseFloat(receiptAmount) || 0;
+            setBillAllocations(doFifoAllocation(bills, amt));
+        }
+    }, [receiptAmount, allocMode, receiptModal]);
+
+    const totalAllocated = Object.values(billAllocations).reduce((s, v) => s + v, 0);
+
     const handleRecordReceipt = () => {
         if (!receiptModal || !receiptAmount || +receiptAmount <= 0) return;
         const bal = getBalance(receiptModal);
         const amt = Math.min(+receiptAmount, bal);
+        const allocations = Object.entries(billAllocations)
+            .filter(([_, v]) => v > 0)
+            .map(([movementId, amount]) => ({ movementId, amount }));
         onPaymentReceipt?.({
             partyName: receiptModal.name,
             partyPhone: receiptModal.phone || "",
             amount: amt,
             paymentMode: receiptMode,
             notes: receiptNotes || `Udhaar settlement from ${receiptModal.name}`,
+            allocations,
         });
-        toast?.(`Payment of ${fmt(amt)} recorded from ${receiptModal.name}`, "success");
+        toast?.(`Payment of ${fmt(amt)} allocated against ${allocations.length} bill(s) from ${receiptModal.name}`, "success");
         setReceiptModal(null);
         setReceiptAmount("");
         setReceiptMode("Cash");
         setReceiptNotes("");
+        setBillAllocations({});
+        setAllocMode("fifo");
     };
 
     const AGING_COLORS = {
@@ -283,8 +374,8 @@ export function PartiesPage({ parties, movements, vehicles, activeShopId, onSave
                                                 <td style={{ padding: "12px 14px" }}>
                                                     <div style={{ display: "flex", gap: 5 }} onClick={e => e.stopPropagation()}>
                                                         <Btn size="xs" variant="subtle" onClick={() => { setEditParty(p); setShowAddModal(true); }}>Edit</Btn>
-                                                        {bal > 0 && view === "customers" && (
-                                                            <Btn size="xs" variant="emerald" onClick={() => { setReceiptModal(p); setReceiptAmount(String(bal)); }}>💰</Btn>
+                                                        {bal > 0 && (view === "customers" || view === "suppliers") && (
+                                                            <Btn size="xs" variant="emerald" onClick={() => handleOpenReceiptModal(p)}>💰</Btn>
                                                         )}
                                                         {bal > 0 && p.phone && (
                                                             <Btn size="xs" onClick={() => {
@@ -335,14 +426,22 @@ export function PartiesPage({ parties, movements, vehicles, activeShopId, onSave
                                                             <div style={{ color: T.t3, fontSize: 12 }}>No transactions yet.</div>
                                                         ) : (
                                                             <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                                                                {getPartyLedger(p).map(m => (
-                                                                    <div key={m.id} style={{ display: "flex", justifyContent: "space-between", padding: "6px 10px", background: T.card, borderRadius: 6, fontSize: 11 }}>
-                                                                        <span style={{ color: T.t3 }}>{fmtDate(m.date)} · {m.type}</span>
-                                                                        <span style={{ color: T.t2 }}>{m.productName}</span>
-                                                                        <span style={{ fontFamily: FONT.mono, fontWeight: 700, color: m.type === "SALE" || m.type === "PURCHASE" ? T.amber : T.emerald }}>{fmt(m.total)}</span>
-                                                                        <span style={{ color: m.paymentStatus === "paid" ? T.emerald : T.crimson, fontWeight: 600, fontSize: 10 }}>{m.paymentStatus}</span>
-                                                                    </div>
-                                                                ))}
+                                                                {getPartyLedger(p).map(m => {
+                                                                    const billOutstanding = (m.type === "SALE" || m.type === "PURCHASE") && (m.paymentStatus === "pending" || m.paymentStatus === "partial")
+                                                                        ? (m.total || 0) - (m.paidAmount || 0)
+                                                                        : null;
+                                                                    return (
+                                                                        <div key={m.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 10px", background: T.card, borderRadius: 6, fontSize: 11 }}>
+                                                                            <span style={{ color: T.t3, minWidth: 120 }}>{fmtDate(m.date)} · {m.type}</span>
+                                                                            <span style={{ color: T.t2, flex: 1, marginLeft: 8 }}>{m.productName}{m.invoiceNo ? ` · ${m.invoiceNo}` : ""}</span>
+                                                                            <span style={{ fontFamily: FONT.mono, fontWeight: 700, color: m.type === "SALE" || m.type === "PURCHASE" ? T.amber : T.emerald, minWidth: 70, textAlign: "right" }}>{fmt(m.total)}</span>
+                                                                            {billOutstanding !== null && (
+                                                                                <span style={{ fontFamily: FONT.mono, fontWeight: 700, color: T.crimson, fontSize: 10, minWidth: 70, textAlign: "right", marginLeft: 8 }}>Due: {fmt(billOutstanding)}</span>
+                                                                            )}
+                                                                            <span style={{ color: m.paymentStatus === "paid" ? T.emerald : m.paymentStatus === "partial" ? T.amber : T.crimson, fontWeight: 600, fontSize: 10, minWidth: 55, textAlign: "right", marginLeft: 8, textTransform: "uppercase" }}>{m.paymentStatus}</span>
+                                                                        </div>
+                                                                    );
+                                                                })}
                                                             </div>
                                                         )}
                                                         {p.notes && <div style={{ marginTop: 8, padding: "6px 10px", background: `${T.amber}08`, borderRadius: 6, fontSize: 11, color: T.t3 }}>📝 {p.notes}</div>}
@@ -372,36 +471,106 @@ export function PartiesPage({ parties, movements, vehicles, activeShopId, onSave
                 activeShopId={activeShopId}
             />
 
-            <Modal open={!!receiptModal} onClose={() => { setReceiptModal(null); setReceiptAmount(""); setReceiptMode("Cash"); setReceiptNotes(""); }} title="Record Payment Receipt" width={480}>
-                {receiptModal && (
-                    <>
-                        <div style={{ background: T.surface, border: `1px solid ${T.border}`, borderRadius: 10, padding: 14, marginBottom: 16 }}>
-                            <div style={{ fontSize: 14, fontWeight: 800, color: T.t1 }}>{receiptModal.name}</div>
-                            <div style={{ fontSize: 12, color: T.t3, marginTop: 4 }}>Outstanding: <span style={{ color: T.crimson, fontWeight: 800, fontFamily: FONT.mono }}>{fmt(getBalance(receiptModal))}</span></div>
-                        </div>
-                        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 }}>
-                            <Field label="Amount (₹)">
-                                <Input type="number" value={receiptAmount} onChange={setReceiptAmount} prefix="₹" />
+            <Modal open={!!receiptModal} onClose={() => { setReceiptModal(null); setReceiptAmount(""); setReceiptMode("Cash"); setReceiptNotes(""); setBillAllocations({}); setAllocMode("fifo"); }} title="Record Payment Receipt" width={640}>
+                {receiptModal && (() => {
+                    const outstandingBills = getOutstandingBills(receiptModal);
+                    const bal = getBalance(receiptModal);
+                    return (
+                        <>
+                            <div style={{ background: T.surface, border: `1px solid ${T.border}`, borderRadius: 10, padding: 14, marginBottom: 16 }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                                    <div>
+                                        <div style={{ fontSize: 14, fontWeight: 800, color: T.t1 }}>{receiptModal.name}</div>
+                                        <div style={{ fontSize: 12, color: T.t3, marginTop: 4 }}>Outstanding: <span style={{ color: T.crimson, fontWeight: 800, fontFamily: FONT.mono }}>{fmt(bal)}</span></div>
+                                    </div>
+                                    <div style={{ fontSize: 11, color: T.t3 }}>{outstandingBills.length} pending bill(s)</div>
+                                </div>
+                            </div>
+                            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 }}>
+                                <Field label="Amount (₹)">
+                                    <Input type="number" value={receiptAmount} onChange={setReceiptAmount} prefix="₹" />
+                                </Field>
+                                <Field label="Payment Mode">
+                                    <Select value={receiptMode} onChange={setReceiptMode} options={[
+                                        { value: "Cash", label: "Cash" },
+                                        { value: "UPI", label: "UPI" },
+                                        { value: "Bank Transfer", label: "Bank Transfer" },
+                                        { value: "Cheque", label: "Cheque" },
+                                        { value: "Card", label: "Card" },
+                                    ]} />
+                                </Field>
+                            </div>
+
+                            {outstandingBills.length > 0 && (
+                                <div style={{ marginBottom: 14 }}>
+                                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                                        <div style={{ fontSize: 12, fontWeight: 800, color: T.t1 }}>Allocate Against Bills</div>
+                                        <div style={{ display: "flex", gap: 6 }}>
+                                            <button onClick={() => setAllocMode("fifo")} style={{ background: allocMode === "fifo" ? `${T.amber}22` : "transparent", color: allocMode === "fifo" ? T.amber : T.t3, border: `1px solid ${allocMode === "fifo" ? T.amber + "44" : T.border}`, borderRadius: 6, padding: "4px 10px", fontSize: 10, fontWeight: 700, cursor: "pointer", fontFamily: FONT.ui }}>FIFO Auto</button>
+                                            <button onClick={() => setAllocMode("manual")} style={{ background: allocMode === "manual" ? `${T.amber}22` : "transparent", color: allocMode === "manual" ? T.amber : T.t3, border: `1px solid ${allocMode === "manual" ? T.amber + "44" : T.border}`, borderRadius: 6, padding: "4px 10px", fontSize: 10, fontWeight: 700, cursor: "pointer", fontFamily: FONT.ui }}>Manual</button>
+                                        </div>
+                                    </div>
+                                    <div style={{ maxHeight: 220, overflowY: "auto", border: `1px solid ${T.border}`, borderRadius: 10, background: T.surface }}>
+                                        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                                            <thead>
+                                                <tr style={{ borderBottom: `1px solid ${T.border}` }}>
+                                                    <th style={{ padding: "8px 10px", textAlign: "left", fontSize: 9, fontWeight: 700, color: T.t3, textTransform: "uppercase" }}></th>
+                                                    <th style={{ padding: "8px 10px", textAlign: "left", fontSize: 9, fontWeight: 700, color: T.t3, textTransform: "uppercase" }}>Date</th>
+                                                    <th style={{ padding: "8px 10px", textAlign: "left", fontSize: 9, fontWeight: 700, color: T.t3, textTransform: "uppercase" }}>Invoice</th>
+                                                    <th style={{ padding: "8px 10px", textAlign: "right", fontSize: 9, fontWeight: 700, color: T.t3, textTransform: "uppercase" }}>Bill Amt</th>
+                                                    <th style={{ padding: "8px 10px", textAlign: "right", fontSize: 9, fontWeight: 700, color: T.t3, textTransform: "uppercase" }}>Outstanding</th>
+                                                    <th style={{ padding: "8px 10px", textAlign: "right", fontSize: 9, fontWeight: 700, color: T.t3, textTransform: "uppercase" }}>Allocate</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                {outstandingBills.map(bill => {
+                                                    const isSelected = !!billAllocations[bill.id];
+                                                    const allocAmt = billAllocations[bill.id] || 0;
+                                                    return (
+                                                        <tr key={bill.id} style={{ borderBottom: `1px solid ${T.border}`, background: isSelected ? `${T.emerald}08` : "transparent" }}>
+                                                            <td style={{ padding: "6px 10px" }}>
+                                                                <input type="checkbox" checked={isSelected} onChange={() => handleToggleBill(bill)} style={{ cursor: "pointer", accentColor: T.emerald }} />
+                                                            </td>
+                                                            <td style={{ padding: "6px 10px", fontSize: 11, color: T.t2 }}>{fmtDate(bill.date)}</td>
+                                                            <td style={{ padding: "6px 10px", fontSize: 11, color: T.t1, fontWeight: 600, fontFamily: FONT.mono }}>{bill.invoiceNo || bill.id.slice(0, 8)}</td>
+                                                            <td style={{ padding: "6px 10px", fontSize: 11, color: T.t2, fontFamily: FONT.mono, textAlign: "right" }}>{fmt(bill.total)}</td>
+                                                            <td style={{ padding: "6px 10px", fontSize: 11, color: T.crimson, fontWeight: 700, fontFamily: FONT.mono, textAlign: "right" }}>{fmt(bill.billOutstanding)}</td>
+                                                            <td style={{ padding: "6px 10px", textAlign: "right" }}>
+                                                                {isSelected ? (
+                                                                    <input type="number" value={allocAmt} onChange={e => {
+                                                                        const val = Math.min(parseFloat(e.target.value) || 0, bill.billOutstanding);
+                                                                        handleAllocAmountChange(bill.id, val);
+                                                                    }} style={{ width: 80, background: T.card, border: `1px solid ${T.border}`, borderRadius: 6, padding: "4px 8px", color: T.emerald, fontSize: 11, fontFamily: FONT.mono, fontWeight: 700, textAlign: "right", outline: "none" }} />
+                                                                ) : (
+                                                                    <span style={{ fontSize: 11, color: T.t4 }}>—</span>
+                                                                )}
+                                                            </td>
+                                                        </tr>
+                                                    );
+                                                })}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                    <div style={{ display: "flex", justifyContent: "space-between", marginTop: 8, padding: "6px 10px", background: T.card, borderRadius: 8 }}>
+                                        <span style={{ fontSize: 11, fontWeight: 700, color: T.t3 }}>Total Allocated:</span>
+                                        <span style={{ fontSize: 12, fontWeight: 800, fontFamily: FONT.mono, color: Math.abs(totalAllocated - (+receiptAmount || 0)) < 0.01 ? T.emerald : T.amber }}>{fmt(totalAllocated)} / {fmt(+receiptAmount || 0)}</span>
+                                    </div>
+                                    {totalAllocated > (+receiptAmount || 0) + 0.01 && (
+                                        <div style={{ fontSize: 10, color: T.crimson, fontWeight: 600, marginTop: 4 }}>⚠ Allocation exceeds receipt amount</div>
+                                    )}
+                                </div>
+                            )}
+
+                            <Field label="Notes (optional)">
+                                <Input value={receiptNotes} onChange={setReceiptNotes} placeholder="e.g., Settled via Google Pay" />
                             </Field>
-                            <Field label="Payment Mode">
-                                <Select value={receiptMode} onChange={setReceiptMode} options={[
-                                    { value: "Cash", label: "Cash" },
-                                    { value: "UPI", label: "UPI" },
-                                    { value: "Bank Transfer", label: "Bank Transfer" },
-                                    { value: "Cheque", label: "Cheque" },
-                                    { value: "Card", label: "Card" },
-                                ]} />
-                            </Field>
-                        </div>
-                        <Field label="Notes (optional)">
-                            <Input value={receiptNotes} onChange={setReceiptNotes} placeholder="e.g., Settled via Google Pay" />
-                        </Field>
-                        <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 20, paddingTop: 16, borderTop: `1px solid ${T.border}` }}>
-                            <Btn variant="ghost" onClick={() => { setReceiptModal(null); setReceiptAmount(""); setReceiptMode("Cash"); setReceiptNotes(""); }}>Cancel</Btn>
-                            <Btn variant="emerald" onClick={handleRecordReceipt} disabled={!receiptAmount || +receiptAmount <= 0}>💰 Record Receipt</Btn>
-                        </div>
-                    </>
-                )}
+                            <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 20, paddingTop: 16, borderTop: `1px solid ${T.border}` }}>
+                                <Btn variant="ghost" onClick={() => { setReceiptModal(null); setReceiptAmount(""); setReceiptMode("Cash"); setReceiptNotes(""); setBillAllocations({}); setAllocMode("fifo"); }}>Cancel</Btn>
+                                <Btn variant="emerald" onClick={handleRecordReceipt} disabled={!receiptAmount || +receiptAmount <= 0 || totalAllocated > (+receiptAmount || 0) + 0.01}>💰 Record Receipt</Btn>
+                            </div>
+                        </>
+                    );
+                })()}
             </Modal>
         </div>
     );
