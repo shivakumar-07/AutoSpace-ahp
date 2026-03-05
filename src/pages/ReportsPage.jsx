@@ -1,8 +1,9 @@
 import { useMemo, useState } from "react";
 import { T, FONT } from "../theme";
-import { fmt, fmtDate, fmtTime, daysAgo, pct, getDebtAging, exportMovementsCSV, downloadCSV, generateCSV, margin, stockStatus, calculateWeightedAvgCost, getCompanyInfo } from "../utils";
+import { fmt, fmtDate, fmtTime, daysAgo, pct, getDebtAging, exportMovementsCSV, downloadCSV, generateCSV, margin, stockStatus, calculateWeightedAvgCost, getCompanyInfo, getMovementConfig } from "../utils";
 import { StatCard, Btn, Input, Select } from "../components/ui";
 import { useStore } from "../store";
+import { computeCostCentrePnL, generateJournalEntries, CHART_OF_ACCOUNTS } from "../accounting";
 
 export function ReportsPage({ movements, products, activeShopId, onPaymentReceipt, toast, parties }) {
     const [view, setView] = useState("overview");
@@ -10,6 +11,20 @@ export function ReportsPage({ movements, products, activeShopId, onPaymentReceip
     const [selectedDate, setSelectedDate] = useState(new Date().toISOString().slice(0, 10)); // YYYY-MM-DD
     const [dayBookFilter, setDayBookFilter] = useState("ALL");
     const [valuationMethod, setValuationMethod] = useState("FIFO");
+    const [reportDateFrom, setReportDateFrom] = useState(() => { const d = new Date(); d.setMonth(d.getMonth() - 3); return d.toISOString().slice(0, 10); });
+    const [reportDateTo, setReportDateTo] = useState(new Date().toISOString().slice(0, 10));
+    const [stockLedgerItem, setStockLedgerItem] = useState("");
+    const [slowDays, setSlowDays] = useState(60);
+    const [salesRegSort, setSalesRegSort] = useState("date");
+    const [purchRegSort, setPurchRegSort] = useState("date");
+    const [eInvoiceSelectedSale, setEInvoiceSelectedSale] = useState("");
+    const [eWayBillSelectedSale, setEWayBillSelectedSale] = useState("");
+    const [eWayBillTransport, setEWayBillTransport] = useState({ vehicleNo: "", transporterName: "", transporterId: "", distance: "", transMode: "Road" });
+    const [gstr2bCsvData, setGstr2bCsvData] = useState([]);
+    const [gstr2bMatchResult, setGstr2bMatchResult] = useState(null);
+    const [gstr9Year, setGstr9Year] = useState(String(new Date().getFullYear() - 1));
+    const [tdsRate, setTdsRate] = useState(2);
+    const [tdsEntries, setTdsEntries] = useState(() => { try { return JSON.parse(localStorage.getItem("vl_tds_entries")) || []; } catch { return []; } });
 
     const { auditLog } = useStore();
 
@@ -98,10 +113,22 @@ export function ReportsPage({ movements, products, activeShopId, onPaymentReceip
         { id: "gstr3b", label: "GSTR-3B", icon: "⚖️" },
         { id: "daybook", label: "Day Book", icon: "📖" },
         { id: "itc", label: "ITC Register", icon: "📥" },
+        { id: "eInvoice", label: "E-Invoice", icon: "🧾" },
+        { id: "eWayBill", label: "E-Way Bill", icon: "🚚" },
+        { id: "gstr2b", label: "GSTR-2B / ITC Recon", icon: "🔄" },
+        { id: "gstr9", label: "GSTR-9 Annual", icon: "📅" },
+        { id: "tds", label: "TDS", icon: "🏦" },
         { id: "valuation", label: "Stock Valuation", icon: "📦" },
         { id: "balance", label: "Balance Sheet", icon: "⚖️" },
         { id: "parties", label: "Party Ledgers", icon: "📒" },
+        { id: "salesRegister", label: "Sales Register", icon: "🧾" },
+        { id: "purchaseRegister", label: "Purchase Register", icon: "📋" },
+        { id: "stockLedger", label: "Stock Ledger", icon: "📜" },
+        { id: "customerProfit", label: "Customer Profitability", icon: "👤" },
+        { id: "vendorPerf", label: "Vendor Performance", icon: "🏭" },
+        { id: "slowMoving", label: "Slow/Non-Moving", icon: "🐌" },
         { id: "audit", label: "Audit Log", icon: "🔍" },
+        { id: "ccPnl", label: "CC-wise P&L", icon: "🏢" },
     ];
 
     // ===== GSTR-1 DATA =====
@@ -220,6 +247,369 @@ export function ReportsPage({ movements, products, activeShopId, onPaymentReceip
         });
     }, [shopProducts, shopMovements, valuationMethod]);
 
+    const reportFromTs = useMemo(() => new Date(reportDateFrom).getTime(), [reportDateFrom]);
+    const reportToTs = useMemo(() => new Date(reportDateTo).setHours(23, 59, 59, 999), [reportDateTo]);
+    const periodMovements = useMemo(() => shopMovements.filter(m => m.date >= reportFromTs && m.date <= reportToTs), [shopMovements, reportFromTs, reportToTs]);
+
+    const salesRegisterData = useMemo(() => {
+        const rows = periodMovements.filter(m => m.type === "SALE").map(m => {
+            const taxable = m.total - (m.gstAmount || 0);
+            const gstRate = m.gstRate || 18;
+            const isIGST = false;
+            return {
+                date: m.date,
+                invoiceNo: m.invoiceNo || `INV-${m.id}`,
+                party: m.customerName || "Cash Customer",
+                taxableValue: taxable,
+                cgst: isIGST ? 0 : (m.gstAmount || 0) / 2,
+                sgst: isIGST ? 0 : (m.gstAmount || 0) / 2,
+                igst: isIGST ? (m.gstAmount || 0) : 0,
+                total: m.total,
+                paymentStatus: m.paymentStatus || "paid",
+                paymentMode: m.paymentMode || m.payment || "Cash",
+            };
+        });
+        const sortFn = salesRegSort === "date" ? (a, b) => b.date - a.date
+            : salesRegSort === "total" ? (a, b) => b.total - a.total
+            : salesRegSort === "party" ? (a, b) => a.party.localeCompare(b.party)
+            : (a, b) => b.date - a.date;
+        rows.sort(sortFn);
+        return rows;
+    }, [periodMovements, salesRegSort]);
+
+    const purchaseRegisterData = useMemo(() => {
+        const rows = periodMovements.filter(m => m.type === "PURCHASE").map(m => {
+            const taxable = m.total - (m.gstAmount || 0);
+            return {
+                date: m.date,
+                billNo: m.invoiceNo || `PUR-${m.id}`,
+                vendor: m.supplierName || m.supplier || "Direct Purchase",
+                taxableValue: taxable,
+                tax: m.gstAmount || 0,
+                total: m.total,
+                paymentStatus: m.paymentStatus || "paid",
+                paymentMode: m.paymentMode || m.payment || "Cash",
+            };
+        });
+        const sortFn = purchRegSort === "date" ? (a, b) => b.date - a.date
+            : purchRegSort === "total" ? (a, b) => b.total - a.total
+            : purchRegSort === "vendor" ? (a, b) => a.vendor.localeCompare(b.vendor)
+            : (a, b) => b.date - a.date;
+        rows.sort(sortFn);
+        return rows;
+    }, [periodMovements, purchRegSort]);
+
+    const stockLedgerData = useMemo(() => {
+        if (!stockLedgerItem) return [];
+        const itemMovements = shopMovements.filter(m => m.productId === stockLedgerItem).sort((a, b) => a.date - b.date);
+        let balance = 0;
+        return itemMovements.map(m => {
+            const cfg = getMovementConfig(m.type);
+            const qtyIn = cfg.stockEffect > 0 ? m.qty : 0;
+            const qtyOut = cfg.stockEffect < 0 ? m.qty : 0;
+            if (m.type === "AUDIT" && m.adjustmentMeta) {
+                balance = m.adjustmentMeta.newStock;
+            } else if (m.type !== "ESTIMATE" && m.type !== "RECEIPT" && m.type !== "PAYMENT") {
+                balance += cfg.stockEffect * m.qty;
+            }
+            return {
+                date: m.date,
+                type: m.type,
+                typeLabel: cfg.label,
+                refNo: m.invoiceNo || m.id,
+                qtyIn,
+                qtyOut,
+                balance,
+                rate: m.unitPrice || 0,
+                value: (m.unitPrice || 0) * m.qty,
+                party: m.customerName || m.supplierName || m.supplier || "",
+                note: m.note || "",
+            };
+        });
+    }, [shopMovements, stockLedgerItem]);
+
+    const customerProfitData = useMemo(() => {
+        const customers = {};
+        shopMovements.forEach(m => {
+            if (m.type === "SALE" && m.customerName) {
+                if (!customers[m.customerName]) customers[m.customerName] = { name: m.customerName, revenue: 0, cogs: 0, qty: 0, txnCount: 0 };
+                customers[m.customerName].revenue += m.total;
+                const prod = shopProducts.find(p => p.id === m.productId);
+                customers[m.customerName].cogs += (prod ? prod.buyPrice : 0) * m.qty;
+                customers[m.customerName].qty += m.qty;
+                customers[m.customerName].txnCount++;
+            }
+        });
+        return Object.values(customers).map(c => ({
+            ...c,
+            grossProfit: c.revenue - c.cogs,
+            marginPct: c.revenue > 0 ? ((c.revenue - c.cogs) / c.revenue * 100).toFixed(1) : "0.0",
+        })).sort((a, b) => b.grossProfit - a.grossProfit);
+    }, [shopMovements, shopProducts]);
+
+    const vendorPerfData = useMemo(() => {
+        const vendors = {};
+        shopMovements.forEach(m => {
+            const vendorName = m.supplierName || m.supplier;
+            if (m.type === "PURCHASE" && vendorName) {
+                if (!vendors[vendorName]) vendors[vendorName] = { name: vendorName, totalPurchases: 0, txnCount: 0, totalQty: 0, returnQty: 0, returnValue: 0, dates: [] };
+                vendors[vendorName].totalPurchases += m.total;
+                vendors[vendorName].txnCount++;
+                vendors[vendorName].totalQty += m.qty;
+                vendors[vendorName].dates.push(m.date);
+            }
+            if (m.type === "RETURN_OUT" && vendorName) {
+                if (!vendors[vendorName]) vendors[vendorName] = { name: vendorName, totalPurchases: 0, txnCount: 0, totalQty: 0, returnQty: 0, returnValue: 0, dates: [] };
+                vendors[vendorName].returnQty += m.qty;
+                vendors[vendorName].returnValue += m.total;
+            }
+        });
+        return Object.values(vendors).map(v => {
+            const sortedDates = v.dates.sort((a, b) => a - b);
+            let avgDeliveryGap = 0;
+            if (sortedDates.length > 1) {
+                const gaps = [];
+                for (let i = 1; i < sortedDates.length; i++) gaps.push((sortedDates[i] - sortedDates[i - 1]) / 86400000);
+                avgDeliveryGap = Math.round(gaps.reduce((s, g) => s + g, 0) / gaps.length);
+            }
+            return {
+                ...v,
+                avgDeliveryGap,
+                returnPct: v.totalQty > 0 ? ((v.returnQty / v.totalQty) * 100).toFixed(1) : "0.0",
+                avgOrderValue: v.txnCount > 0 ? Math.round(v.totalPurchases / v.txnCount) : 0,
+            };
+        }).sort((a, b) => b.totalPurchases - a.totalPurchases);
+    }, [shopMovements]);
+
+    const slowMovingData = useMemo(() => {
+        const threshold = Date.now() - slowDays * 86400000;
+        return shopProducts.filter(p => p.stock > 0).map(p => {
+            const sales = shopMovements.filter(m => m.productId === p.id && m.type === "SALE");
+            const recentSales = sales.filter(s => s.date >= threshold);
+            const lastSale = sales.sort((a, b) => b.date - a.date)[0];
+            const totalSoldRecent = recentSales.reduce((s, m) => s + m.qty, 0);
+            return {
+                ...p,
+                lastSaleDate: lastSale ? lastSale.date : null,
+                recentQtySold: totalSoldRecent,
+                daysSinceLastSale: lastSale ? Math.floor((Date.now() - lastSale.date) / 86400000) : 999,
+                lockedValue: p.buyPrice * p.stock,
+            };
+        }).filter(p => p.recentQtySold === 0 || p.daysSinceLastSale > slowDays)
+          .sort((a, b) => b.lockedValue - a.lockedValue);
+    }, [shopProducts, shopMovements, slowDays]);
+
+    const salesForEInvoice = useMemo(() => shopMovements.filter(m => m.type === "SALE").sort((a, b) => b.date - a.date), [shopMovements]);
+
+    const generateIRNPayload = (sale) => {
+        if (!sale) return null;
+        const party = shopParties.find(p => p.name === sale.customerName);
+        const prod = shopProducts.find(p => p.id === sale.productId);
+        const company = getCompanyInfo();
+        const taxable = sale.total - (sale.gstAmount || 0);
+        const gstRate = sale.gstRate || 18;
+        return {
+            Version: "1.1",
+            TranDtls: { TaxSch: "GST", SupTyp: "B2B", RegRev: "N", EcmGstin: null, IgstOnIntra: "N" },
+            DocDtls: { Typ: "INV", No: sale.invoiceNo || `INV-${sale.id}`, Dt: new Date(sale.date).toLocaleDateString("en-IN", { day: "2-digit", month: "2-digit", year: "numeric" }) },
+            SellerDtls: { Gstin: company.gstin || "36AAXYZ1234X1Z5", LglNm: company.companyName || "AutoMobileSpace", Addr1: company.address || "Shop Address", Loc: company.city || "Hyderabad", Pin: parseInt(company.pincode || "500001"), Stcd: "36" },
+            BuyerDtls: { Gstin: party?.gstin || "URP", LglNm: sale.customerName || "Cash Customer", Pos: "36", Addr1: party?.address || "Address", Loc: party?.city || "Local", Pin: parseInt(party?.pincode || "500001"), Stcd: "36" },
+            ItemList: [{ SlNo: "1", PrdDesc: prod?.name || sale.productName || "Product", IsServc: "N", HsnCd: prod?.hsnCode || "8708", Qty: sale.qty, FreeQty: 0, Unit: "NOS", UnitPrice: sale.unitPrice || 0, TotAmt: taxable, Discount: 0, PreTaxVal: taxable, AssAmt: taxable, GstRt: gstRate, CgstAmt: (sale.gstAmount || 0) / 2, SgstAmt: (sale.gstAmount || 0) / 2, IgstAmt: 0, CesRt: 0, CesAmt: 0, CesNonAdvlAmt: 0, StateCesRt: 0, StateCesAmt: 0, StateCesNonAdvlAmt: 0, OthChrg: 0, TotItemVal: sale.total }],
+            ValDtls: { AssVal: taxable, CgstVal: (sale.gstAmount || 0) / 2, SgstVal: (sale.gstAmount || 0) / 2, IgstVal: 0, CesVal: 0, StCesVal: 0, Discount: 0, OthChrg: 0, RndOffAmt: 0, TotInvVal: sale.total },
+            EwbDtls: null,
+            _meta: { irn: `IRN-${Date.now().toString(36).toUpperCase()}-${(sale.invoiceNo || sale.id).replace(/[^A-Z0-9]/gi, "")}`, generatedAt: new Date().toISOString(), status: "GENERATED" }
+        };
+    };
+
+    const eWayBillEligibleSales = useMemo(() => shopMovements.filter(m => m.type === "SALE" && m.total >= 50000).sort((a, b) => b.date - a.date), [shopMovements]);
+
+    const generateEWayBillPayload = (sale, transport) => {
+        if (!sale) return null;
+        const party = shopParties.find(p => p.name === sale.customerName);
+        const company = getCompanyInfo();
+        const taxable = sale.total - (sale.gstAmount || 0);
+        return {
+            supplyType: "O",
+            subSupplyType: 1,
+            docType: "INV",
+            docNo: sale.invoiceNo || `INV-${sale.id}`,
+            docDate: new Date(sale.date).toLocaleDateString("en-IN", { day: "2-digit", month: "2-digit", year: "numeric" }),
+            fromGstin: company.gstin || "36AAXYZ1234X1Z5",
+            fromTrdName: company.companyName || "AutoMobileSpace",
+            fromAddr1: company.address || "Shop Address",
+            fromPlace: company.city || "Hyderabad",
+            fromPincode: parseInt(company.pincode || "500001"),
+            fromStateCode: 36,
+            toGstin: party?.gstin || "URP",
+            toTrdName: sale.customerName || "Cash Customer",
+            toAddr1: party?.address || "Buyer Address",
+            toPlace: party?.city || "Local",
+            toPincode: parseInt(party?.pincode || "500001"),
+            toStateCode: 36,
+            totalValue: taxable,
+            cgstValue: (sale.gstAmount || 0) / 2,
+            sgstValue: (sale.gstAmount || 0) / 2,
+            igstValue: 0,
+            cessValue: 0,
+            totInvValue: sale.total,
+            transporterId: transport.transporterId || "",
+            transporterName: transport.transporterName || "",
+            transMode: transport.transMode === "Road" ? 1 : transport.transMode === "Rail" ? 2 : transport.transMode === "Air" ? 3 : 4,
+            transDistance: parseInt(transport.distance) || 0,
+            vehicleNo: transport.vehicleNo || "",
+            vehicleType: "R",
+            _meta: { ewbNo: `EWB-${Date.now().toString(36).toUpperCase()}`, generatedAt: new Date().toISOString(), validUpto: new Date(Date.now() + 86400000).toISOString(), status: "GENERATED" }
+        };
+    };
+
+    const gstr9Data = useMemo(() => {
+        const year = parseInt(gstr9Year);
+        const fyStart = new Date(year, 3, 1).getTime();
+        const fyEnd = new Date(year + 1, 2, 31, 23, 59, 59, 999).getTime();
+        const fyMovements = shopMovements.filter(m => m.date >= fyStart && m.date <= fyEnd);
+
+        const monthlyData = {};
+        for (let mo = 0; mo < 12; mo++) {
+            const mStart = new Date(year + (mo >= 9 ? 1 : 0), mo < 9 ? mo + 3 : mo - 9, 1).getTime();
+            const mEnd = new Date(year + (mo >= 9 ? 1 : 0), mo < 9 ? mo + 4 : mo - 8, 0, 23, 59, 59, 999).getTime();
+            const mLabel = new Date(mStart).toLocaleDateString("en-IN", { month: "short", year: "numeric" });
+            const mMov = fyMovements.filter(m => m.date >= mStart && m.date <= mEnd);
+            const sales = mMov.filter(m => m.type === "SALE");
+            const purchases = mMov.filter(m => m.type === "PURCHASE");
+            const salesTotal = sales.reduce((s, m) => s + m.total, 0);
+            const salesGst = sales.reduce((s, m) => s + (m.gstAmount || 0), 0);
+            const purchTotal = purchases.reduce((s, m) => s + m.total, 0);
+            const purchGst = purchases.reduce((s, m) => s + (m.gstAmount || 0), 0);
+            monthlyData[mLabel] = { label: mLabel, salesTotal, salesTaxable: salesTotal - salesGst, salesGst, purchTotal, purchTaxable: purchTotal - purchGst, purchGst, invoiceCount: sales.length, netPayable: salesGst - purchGst };
+        }
+
+        const totalSales = fyMovements.filter(m => m.type === "SALE").reduce((s, m) => s + m.total, 0);
+        const totalSalesGst = fyMovements.filter(m => m.type === "SALE").reduce((s, m) => s + (m.gstAmount || 0), 0);
+        const totalPurchases = fyMovements.filter(m => m.type === "PURCHASE").reduce((s, m) => s + m.total, 0);
+        const totalPurchGst = fyMovements.filter(m => m.type === "PURCHASE").reduce((s, m) => s + (m.gstAmount || 0), 0);
+        const totalReturns = fyMovements.filter(m => m.type === "RETURN_IN").reduce((s, m) => s + m.total, 0);
+        const totalCreditNotes = fyMovements.filter(m => m.type === "CREDIT_NOTE").reduce((s, m) => s + m.total, 0);
+        const totalDebitNotes = fyMovements.filter(m => m.type === "DEBIT_NOTE").reduce((s, m) => s + m.total, 0);
+
+        return {
+            fy: `FY ${year}-${(year + 1).toString().slice(-2)}`,
+            monthly: Object.values(monthlyData),
+            totalSales, totalSalesTaxable: totalSales - totalSalesGst, totalSalesGst,
+            totalPurchases, totalPurchTaxable: totalPurchases - totalPurchGst, totalPurchGst,
+            totalReturns, totalCreditNotes, totalDebitNotes,
+            netTaxPayable: totalSalesGst - totalPurchGst,
+            totalInvoices: fyMovements.filter(m => m.type === "SALE").length,
+            totalBills: fyMovements.filter(m => m.type === "PURCHASE").length,
+        };
+    }, [shopMovements, gstr9Year]);
+
+    const handleGstr2bCsvImport = (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+            const text = ev.target.result;
+            const lines = text.split("\n").filter(l => l.trim());
+            if (lines.length < 2) { toast?.("CSV must have a header row and data rows", "error"); return; }
+            const headers = lines[0].split(",").map(h => h.trim().replace(/^"|"$/g, ""));
+            const rows = lines.slice(1).map(line => {
+                const vals = line.split(",").map(v => v.trim().replace(/^"|"$/g, ""));
+                const obj = {};
+                headers.forEach((h, i) => { obj[h.toLowerCase().replace(/\s+/g, "_")] = vals[i] || ""; });
+                return obj;
+            });
+            setGstr2bCsvData(rows);
+            toast?.(`Imported ${rows.length} rows from GSTR-2B CSV`, "success");
+        };
+        reader.readAsText(file);
+    };
+
+    const runGstr2bMatching = () => {
+        const purchaseBills = shopMovements.filter(m => m.type === "PURCHASE");
+        const matched = [];
+        const unmatchedBook = [];
+        const unmatchedGstr2b = [];
+        const mismatched = [];
+
+        const usedPurchaseIds = new Set();
+        const usedCsvIndices = new Set();
+
+        gstr2bCsvData.forEach((row, csvIdx) => {
+            const csvInvNo = (row.invoice_no || row.invoiceno || row.inv_no || "").trim();
+            const csvAmount = parseFloat(row.total || row.invoice_value || row.amount || 0);
+            const csvGstin = (row.gstin || row.supplier_gstin || "").trim();
+            const csvTaxable = parseFloat(row.taxable_value || row.taxable || 0);
+
+            let bestMatch = null;
+            let bestScore = 0;
+
+            purchaseBills.forEach(m => {
+                if (usedPurchaseIds.has(m.id)) return;
+                let score = 0;
+                const mInvNo = (m.invoiceNo || "").trim();
+                if (csvInvNo && mInvNo && csvInvNo === mInvNo) score += 3;
+                if (csvAmount > 0 && Math.abs(csvAmount - m.total) < 1) score += 2;
+                else if (csvAmount > 0 && Math.abs(csvAmount - m.total) < m.total * 0.05) score += 1;
+                if (csvGstin) {
+                    const party = shopParties.find(p => (p.name === m.supplierName || p.name === m.supplier));
+                    if (party?.gstin === csvGstin) score += 2;
+                }
+                if (score > bestScore) { bestScore = score; bestMatch = m; }
+            });
+
+            if (bestMatch && bestScore >= 2) {
+                usedPurchaseIds.add(bestMatch.id);
+                usedCsvIndices.add(csvIdx);
+                const amountMatch = Math.abs(csvAmount - bestMatch.total) < 1;
+                if (amountMatch) {
+                    matched.push({ csv: row, book: bestMatch, status: "matched" });
+                } else {
+                    mismatched.push({ csv: row, book: bestMatch, status: "mismatched", diff: csvAmount - bestMatch.total });
+                }
+            } else {
+                unmatchedGstr2b.push({ csv: row, csvIdx });
+            }
+        });
+
+        purchaseBills.forEach(m => {
+            if (!usedPurchaseIds.has(m.id)) unmatchedBook.push(m);
+        });
+
+        setGstr2bMatchResult({ matched, unmatchedBook, unmatchedGstr2b, mismatched, total: gstr2bCsvData.length });
+    };
+
+    const handleTdsDeduction = (partyName, invoiceAmount) => {
+        const tdsAmount = Math.round(invoiceAmount * tdsRate / 100);
+        const entry = {
+            id: `TDS-${Date.now().toString(36)}`,
+            date: Date.now(),
+            partyName,
+            invoiceAmount,
+            tdsRate,
+            tdsAmount,
+            netPayable: invoiceAmount - tdsAmount,
+            section: "194C",
+            status: "Pending",
+            fy: `FY ${new Date().getFullYear()}-${(new Date().getFullYear() + 1).toString().slice(-2)}`,
+        };
+        const updated = [...tdsEntries, entry];
+        setTdsEntries(updated);
+        localStorage.setItem("vl_tds_entries", JSON.stringify(updated));
+        toast?.(`TDS of ${fmt(tdsAmount)} deducted @ ${tdsRate}% on ${fmt(invoiceAmount)}`, "success");
+        return entry;
+    };
+
+    const tdsPartyAggregates = useMemo(() => {
+        const agg = {};
+        tdsEntries.forEach(e => {
+            if (!agg[e.partyName]) agg[e.partyName] = { name: e.partyName, totalInvoice: 0, totalTds: 0, entries: [] };
+            agg[e.partyName].totalInvoice += e.invoiceAmount;
+            agg[e.partyName].totalTds += e.tdsAmount;
+            agg[e.partyName].entries.push(e);
+        });
+        return Object.values(agg).sort((a, b) => b.totalTds - a.totalTds);
+    }, [tdsEntries]);
+
     // ===== PARTY LEDGER TABLE =====
     const renderDebtTable = (title, list, isReceivable) => (
         <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 14, overflow: "hidden", flex: 1, minWidth: 300 }}>
@@ -332,6 +722,67 @@ export function ReportsPage({ movements, products, activeShopId, onPaymentReceip
                         { label: "Weighted Average", value: "Weighted Average" },
                         { label: "Selling Price", value: "Selling Price" },
                     ]} style={{ width: 250 }} />
+                </div>
+            )}
+            {(view === "salesRegister" || view === "purchaseRegister") && (
+                <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                    <div style={{ color: T.t2, fontSize: 14, fontWeight: 600 }}>From:</div>
+                    <Input type="date" value={reportDateFrom} onChange={e => setReportDateFrom(e.target.value)} style={{ width: 170 }} />
+                    <div style={{ color: T.t2, fontSize: 14, fontWeight: 600 }}>To:</div>
+                    <Input type="date" value={reportDateTo} onChange={e => setReportDateTo(e.target.value)} style={{ width: 170 }} />
+                    {view === "salesRegister" && (
+                        <Select value={salesRegSort} onChange={e => setSalesRegSort(e.target.value)} options={[
+                            { label: "Sort by Date", value: "date" },
+                            { label: "Sort by Total", value: "total" },
+                            { label: "Sort by Party", value: "party" },
+                        ]} style={{ width: 170 }} />
+                    )}
+                    {view === "purchaseRegister" && (
+                        <Select value={purchRegSort} onChange={e => setPurchRegSort(e.target.value)} options={[
+                            { label: "Sort by Date", value: "date" },
+                            { label: "Sort by Total", value: "total" },
+                            { label: "Sort by Vendor", value: "vendor" },
+                        ]} style={{ width: 170 }} />
+                    )}
+                </div>
+            )}
+            {view === "stockLedger" && (
+                <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+                    <div style={{ color: T.t2, fontSize: 14, fontWeight: 600 }}>Select Item:</div>
+                    <Select value={stockLedgerItem} onChange={e => setStockLedgerItem(e.target.value)} options={[
+                        { label: "— Select Product —", value: "" },
+                        ...shopProducts.map(p => ({ label: `${p.name} (${p.sku})`, value: p.id }))
+                    ]} style={{ width: 400 }} />
+                </div>
+            )}
+            {view === "slowMoving" && (
+                <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+                    <div style={{ color: T.t2, fontSize: 14, fontWeight: 600 }}>No movement in last:</div>
+                    <Select value={slowDays} onChange={e => setSlowDays(+e.target.value)} options={[
+                        { label: "30 days", value: 30 },
+                        { label: "60 days", value: 60 },
+                        { label: "90 days", value: 90 },
+                        { label: "180 days", value: 180 },
+                    ]} style={{ width: 150 }} />
+                </div>
+            )}
+            {view === "gstr9" && (
+                <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+                    <div style={{ color: T.t2, fontSize: 14, fontWeight: 600 }}>Financial Year Starting:</div>
+                    <Select value={gstr9Year} onChange={e => setGstr9Year(e.target.value)} options={
+                        Array.from({ length: 5 }, (_, i) => { const y = new Date().getFullYear() - i; return { label: `FY ${y}-${(y + 1).toString().slice(-2)}`, value: String(y) }; })
+                    } style={{ width: 200 }} />
+                </div>
+            )}
+            {view === "tds" && (
+                <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+                    <div style={{ color: T.t2, fontSize: 14, fontWeight: 600 }}>TDS Rate (%):</div>
+                    <Select value={tdsRate} onChange={e => setTdsRate(+e.target.value)} options={[
+                        { label: "1% - 194C (Individual)", value: 1 },
+                        { label: "2% - 194C (Others)", value: 2 },
+                        { label: "5% - 194J (Professional)", value: 5 },
+                        { label: "10% - 194J (Technical)", value: 10 },
+                    ]} style={{ width: 280 }} />
                 </div>
             )}
 
@@ -1045,6 +1496,477 @@ export function ReportsPage({ movements, products, activeShopId, onPaymentReceip
                     }}>📥 Export Inventory Valuation CSV</Btn>
                 </div>
             )}
+
+            {/* ===== SALES REGISTER ===== */}
+            {view === "salesRegister" && (
+                <div className="fade-in" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12 }}>
+                        <StatCard label="Total Invoices" value={salesRegisterData.length} color={T.sky} icon="🧾" />
+                        <StatCard label="Total Taxable" value={fmt(salesRegisterData.reduce((s, r) => s + r.taxableValue, 0))} color={T.amber} icon="💰" />
+                        <StatCard label="Total GST" value={fmt(salesRegisterData.reduce((s, r) => s + r.cgst + r.sgst + r.igst, 0))} color={T.emerald} icon="🏛️" />
+                        <StatCard label="Total Revenue" value={fmt(salesRegisterData.reduce((s, r) => s + r.total, 0))} color={T.violet} icon="📈" />
+                    </div>
+                    <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 14, overflow: "hidden" }}>
+                        <div style={{ padding: "16px 20px", background: T.surface, borderBottom: `1px solid ${T.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                            <div style={{ fontWeight: 800, color: T.t1 }}>Sales Register ({reportDateFrom} to {reportDateTo})</div>
+                            <Btn variant="subtle" size="sm" onClick={() => {
+                                const headers = ["Date", "Invoice No", "Party", "Taxable Value", "CGST", "SGST", "IGST", "Total", "Payment Status", "Payment Mode"];
+                                const rows = salesRegisterData.map(r => [fmtDate(r.date), r.invoiceNo, r.party, r.taxableValue, r.cgst, r.sgst, r.igst, r.total, r.paymentStatus, r.paymentMode]);
+                                downloadCSV(`Sales_Register_${reportDateFrom}_to_${reportDateTo}.csv`, generateCSV(headers, rows));
+                            }}>Export CSV</Btn>
+                        </div>
+                        <div style={{ overflowX: "auto" }}>
+                            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                                <thead>
+                                    <tr style={{ borderBottom: `1px solid ${T.border}`, background: `${T.surface}88` }}>
+                                        {["Date", "Invoice No", "Party", "Taxable Value", "CGST", "SGST", "IGST", "Total", "Status"].map(h => (
+                                            <th key={h} style={{ padding: 12, textAlign: "left", color: T.t3, fontSize: 11, whiteSpace: "nowrap" }}>{h}</th>
+                                        ))}
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {salesRegisterData.length === 0 ? (
+                                        <tr><td colSpan={9} style={{ padding: 40, textAlign: "center", color: T.t3 }}>No sales found for this period.</td></tr>
+                                    ) : salesRegisterData.map((r, i) => (
+                                        <tr key={i} className="row-hover" style={{ borderBottom: `1px solid ${T.border}` }}>
+                                            <td style={{ padding: 12, whiteSpace: "nowrap" }}>{fmtDate(r.date)}</td>
+                                            <td style={{ padding: 12, fontFamily: FONT.mono }}>{r.invoiceNo}</td>
+                                            <td style={{ padding: 12, fontWeight: 600 }}>{r.party}</td>
+                                            <td style={{ padding: 12, fontFamily: FONT.mono }}>{fmt(r.taxableValue)}</td>
+                                            <td style={{ padding: 12, fontFamily: FONT.mono }}>{fmt(r.cgst)}</td>
+                                            <td style={{ padding: 12, fontFamily: FONT.mono }}>{fmt(r.sgst)}</td>
+                                            <td style={{ padding: 12, fontFamily: FONT.mono }}>{fmt(r.igst)}</td>
+                                            <td style={{ padding: 12, fontFamily: FONT.mono, fontWeight: 800 }}>{fmt(r.total)}</td>
+                                            <td style={{ padding: 12 }}>
+                                                <span style={{ fontSize: 10, fontWeight: 800, padding: "2px 8px", borderRadius: 4, background: r.paymentStatus === "paid" ? `${T.emerald}22` : `${T.crimson}22`, color: r.paymentStatus === "paid" ? T.emerald : T.crimson }}>{r.paymentStatus}</span>
+                                            </td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                                {salesRegisterData.length > 0 && (
+                                    <tfoot>
+                                        <tr style={{ background: T.surface, fontWeight: 900 }}>
+                                            <td colSpan={3} style={{ padding: 16, textAlign: "right" }}>Totals:</td>
+                                            <td style={{ padding: 16, fontFamily: FONT.mono }}>{fmt(salesRegisterData.reduce((s, r) => s + r.taxableValue, 0))}</td>
+                                            <td style={{ padding: 16, fontFamily: FONT.mono }}>{fmt(salesRegisterData.reduce((s, r) => s + r.cgst, 0))}</td>
+                                            <td style={{ padding: 16, fontFamily: FONT.mono }}>{fmt(salesRegisterData.reduce((s, r) => s + r.sgst, 0))}</td>
+                                            <td style={{ padding: 16, fontFamily: FONT.mono }}>{fmt(salesRegisterData.reduce((s, r) => s + r.igst, 0))}</td>
+                                            <td style={{ padding: 16, fontFamily: FONT.mono, color: T.emerald, fontSize: 16 }}>{fmt(salesRegisterData.reduce((s, r) => s + r.total, 0))}</td>
+                                            <td style={{ padding: 16 }}></td>
+                                        </tr>
+                                    </tfoot>
+                                )}
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* ===== PURCHASE REGISTER ===== */}
+            {view === "purchaseRegister" && (
+                <div className="fade-in" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12 }}>
+                        <StatCard label="Total Bills" value={purchaseRegisterData.length} color={T.sky} icon="📋" />
+                        <StatCard label="Total Taxable" value={fmt(purchaseRegisterData.reduce((s, r) => s + r.taxableValue, 0))} color={T.amber} icon="💰" />
+                        <StatCard label="Total Tax" value={fmt(purchaseRegisterData.reduce((s, r) => s + r.tax, 0))} color={T.emerald} icon="🏛️" />
+                        <StatCard label="Total Purchases" value={fmt(purchaseRegisterData.reduce((s, r) => s + r.total, 0))} color={T.crimson} icon="📥" />
+                    </div>
+                    <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 14, overflow: "hidden" }}>
+                        <div style={{ padding: "16px 20px", background: T.surface, borderBottom: `1px solid ${T.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                            <div style={{ fontWeight: 800, color: T.t1 }}>Purchase Register ({reportDateFrom} to {reportDateTo})</div>
+                            <Btn variant="subtle" size="sm" onClick={() => {
+                                const headers = ["Date", "Bill No", "Vendor", "Taxable Value", "Tax", "Total", "Payment Status", "Payment Mode"];
+                                const rows = purchaseRegisterData.map(r => [fmtDate(r.date), r.billNo, r.vendor, r.taxableValue, r.tax, r.total, r.paymentStatus, r.paymentMode]);
+                                downloadCSV(`Purchase_Register_${reportDateFrom}_to_${reportDateTo}.csv`, generateCSV(headers, rows));
+                            }}>Export CSV</Btn>
+                        </div>
+                        <div style={{ overflowX: "auto" }}>
+                            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                                <thead>
+                                    <tr style={{ borderBottom: `1px solid ${T.border}`, background: `${T.surface}88` }}>
+                                        {["Date", "Bill No", "Vendor", "Taxable Value", "Tax", "Total", "Status", "Mode"].map(h => (
+                                            <th key={h} style={{ padding: 12, textAlign: "left", color: T.t3, fontSize: 11, whiteSpace: "nowrap" }}>{h}</th>
+                                        ))}
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {purchaseRegisterData.length === 0 ? (
+                                        <tr><td colSpan={8} style={{ padding: 40, textAlign: "center", color: T.t3 }}>No purchases found for this period.</td></tr>
+                                    ) : purchaseRegisterData.map((r, i) => (
+                                        <tr key={i} className="row-hover" style={{ borderBottom: `1px solid ${T.border}` }}>
+                                            <td style={{ padding: 12, whiteSpace: "nowrap" }}>{fmtDate(r.date)}</td>
+                                            <td style={{ padding: 12, fontFamily: FONT.mono }}>{r.billNo}</td>
+                                            <td style={{ padding: 12, fontWeight: 600 }}>{r.vendor}</td>
+                                            <td style={{ padding: 12, fontFamily: FONT.mono }}>{fmt(r.taxableValue)}</td>
+                                            <td style={{ padding: 12, fontFamily: FONT.mono }}>{fmt(r.tax)}</td>
+                                            <td style={{ padding: 12, fontFamily: FONT.mono, fontWeight: 800 }}>{fmt(r.total)}</td>
+                                            <td style={{ padding: 12 }}>
+                                                <span style={{ fontSize: 10, fontWeight: 800, padding: "2px 8px", borderRadius: 4, background: r.paymentStatus === "paid" ? `${T.emerald}22` : `${T.crimson}22`, color: r.paymentStatus === "paid" ? T.emerald : T.crimson }}>{r.paymentStatus}</span>
+                                            </td>
+                                            <td style={{ padding: 12, fontSize: 11, color: T.t3 }}>{r.paymentMode}</td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                                {purchaseRegisterData.length > 0 && (
+                                    <tfoot>
+                                        <tr style={{ background: T.surface, fontWeight: 900 }}>
+                                            <td colSpan={3} style={{ padding: 16, textAlign: "right" }}>Totals:</td>
+                                            <td style={{ padding: 16, fontFamily: FONT.mono }}>{fmt(purchaseRegisterData.reduce((s, r) => s + r.taxableValue, 0))}</td>
+                                            <td style={{ padding: 16, fontFamily: FONT.mono }}>{fmt(purchaseRegisterData.reduce((s, r) => s + r.tax, 0))}</td>
+                                            <td style={{ padding: 16, fontFamily: FONT.mono, color: T.sky, fontSize: 16 }}>{fmt(purchaseRegisterData.reduce((s, r) => s + r.total, 0))}</td>
+                                            <td colSpan={2}></td>
+                                        </tr>
+                                    </tfoot>
+                                )}
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* ===== STOCK LEDGER ===== */}
+            {view === "stockLedger" && (
+                <div className="fade-in" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+                    {!stockLedgerItem ? (
+                        <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 14, padding: 60, textAlign: "center" }}>
+                            <div style={{ fontSize: 48, marginBottom: 16 }}>📜</div>
+                            <div style={{ fontSize: 18, fontWeight: 800, color: T.t1, marginBottom: 8 }}>Select a Product</div>
+                            <div style={{ color: T.t3, fontSize: 14 }}>Choose a product from the dropdown above to view its chronological stock movement history.</div>
+                        </div>
+                    ) : (
+                        <>
+                            {(() => {
+                                const prod = shopProducts.find(p => p.id === stockLedgerItem);
+                                const totalIn = stockLedgerData.reduce((s, r) => s + r.qtyIn, 0);
+                                const totalOut = stockLedgerData.reduce((s, r) => s + r.qtyOut, 0);
+                                const currentBal = stockLedgerData.length > 0 ? stockLedgerData[stockLedgerData.length - 1].balance : 0;
+                                return (
+                                    <>
+                                        <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 14, padding: 20 }}>
+                                            <div style={{ fontSize: 18, fontWeight: 900, color: T.t1 }}>{prod?.image} {prod?.name}</div>
+                                            <div style={{ fontSize: 13, color: T.t3, marginTop: 4 }}>SKU: {prod?.sku} | Category: {prod?.category}</div>
+                                        </div>
+                                        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12 }}>
+                                            <StatCard label="Total Qty In" value={totalIn} color={T.emerald} icon="📥" />
+                                            <StatCard label="Total Qty Out" value={totalOut} color={T.crimson} icon="📤" />
+                                            <StatCard label="Current Balance" value={currentBal} color={T.sky} icon="📦" />
+                                            <StatCard label="Transactions" value={stockLedgerData.length} color={T.amber} icon="📜" />
+                                        </div>
+                                    </>
+                                );
+                            })()}
+                            <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 14, overflow: "hidden" }}>
+                                <div style={{ padding: "16px 20px", background: T.surface, borderBottom: `1px solid ${T.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                                    <div style={{ fontWeight: 800, color: T.t1 }}>Movement History</div>
+                                    <Btn variant="subtle" size="sm" onClick={() => {
+                                        const headers = ["Date", "Type", "Ref No", "Party", "Qty In", "Qty Out", "Balance", "Rate", "Value", "Note"];
+                                        const rows = stockLedgerData.map(r => [fmtDate(r.date), r.typeLabel, r.refNo, r.party, r.qtyIn || "", r.qtyOut || "", r.balance, r.rate, r.value, r.note]);
+                                        const prod = shopProducts.find(p => p.id === stockLedgerItem);
+                                        downloadCSV(`Stock_Ledger_${prod?.sku || stockLedgerItem}.csv`, generateCSV(headers, rows));
+                                    }}>Export CSV</Btn>
+                                </div>
+                                <div style={{ overflowX: "auto" }}>
+                                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                                        <thead>
+                                            <tr style={{ borderBottom: `1px solid ${T.border}`, background: `${T.surface}88` }}>
+                                                {["Date", "Type", "Ref No", "Party", "Qty In", "Qty Out", "Balance", "Rate", "Value"].map(h => (
+                                                    <th key={h} style={{ padding: 12, textAlign: "left", color: T.t3, fontSize: 11, whiteSpace: "nowrap" }}>{h}</th>
+                                                ))}
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {stockLedgerData.length === 0 ? (
+                                                <tr><td colSpan={9} style={{ padding: 40, textAlign: "center", color: T.t3 }}>No movements found for this product.</td></tr>
+                                            ) : stockLedgerData.map((r, i) => (
+                                                <tr key={i} className="row-hover" style={{ borderBottom: `1px solid ${T.border}` }}>
+                                                    <td style={{ padding: 12, whiteSpace: "nowrap" }}>{fmtDate(r.date)}</td>
+                                                    <td style={{ padding: 12 }}>
+                                                        <span style={{ fontSize: 10, fontWeight: 800, padding: "2px 8px", borderRadius: 4, background: `${getMovementConfig(r.type).color}22`, color: getMovementConfig(r.type).color }}>{r.typeLabel}</span>
+                                                    </td>
+                                                    <td style={{ padding: 12, fontFamily: FONT.mono, fontSize: 11 }}>{r.refNo}</td>
+                                                    <td style={{ padding: 12, fontSize: 12 }}>{r.party}</td>
+                                                    <td style={{ padding: 12, fontFamily: FONT.mono, color: r.qtyIn > 0 ? T.emerald : T.t3, fontWeight: r.qtyIn > 0 ? 800 : 400 }}>{r.qtyIn > 0 ? `+${r.qtyIn}` : "—"}</td>
+                                                    <td style={{ padding: 12, fontFamily: FONT.mono, color: r.qtyOut > 0 ? T.crimson : T.t3, fontWeight: r.qtyOut > 0 ? 800 : 400 }}>{r.qtyOut > 0 ? `-${r.qtyOut}` : "—"}</td>
+                                                    <td style={{ padding: 12, fontFamily: FONT.mono, fontWeight: 900, color: T.t1 }}>{r.balance}</td>
+                                                    <td style={{ padding: 12, fontFamily: FONT.mono }}>{fmt(r.rate)}</td>
+                                                    <td style={{ padding: 12, fontFamily: FONT.mono }}>{fmt(r.value)}</td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </>
+                    )}
+                </div>
+            )}
+
+            {/* ===== CUSTOMER PROFITABILITY ===== */}
+            {view === "customerProfit" && (
+                <div className="fade-in" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12 }}>
+                        <StatCard label="Total Customers" value={customerProfitData.length} color={T.sky} icon="👤" />
+                        <StatCard label="Total Revenue" value={fmt(customerProfitData.reduce((s, c) => s + c.revenue, 0))} color={T.amber} icon="💰" />
+                        <StatCard label="Total Gross Profit" value={fmt(customerProfitData.reduce((s, c) => s + c.grossProfit, 0))} color={T.emerald} icon="📈" />
+                        <StatCard label="Avg Margin" value={(() => { const tr = customerProfitData.reduce((s, c) => s + c.revenue, 0); const tp = customerProfitData.reduce((s, c) => s + c.grossProfit, 0); return tr > 0 ? ((tp / tr) * 100).toFixed(1) + "%" : "0%"; })()} color={T.violet} icon="📊" />
+                    </div>
+                    <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 14, overflow: "hidden" }}>
+                        <div style={{ padding: "16px 20px", background: T.surface, borderBottom: `1px solid ${T.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                            <div style={{ fontWeight: 800, color: T.t1 }}>Customer Profitability (Ranked by Gross Profit)</div>
+                            <Btn variant="subtle" size="sm" onClick={() => {
+                                const headers = ["Rank", "Customer", "Revenue", "COGS", "Gross Profit", "Margin %", "Units Sold", "Transactions"];
+                                const rows = customerProfitData.map((c, i) => [i + 1, c.name, c.revenue, c.cogs, c.grossProfit, c.marginPct + "%", c.qty, c.txnCount]);
+                                downloadCSV("Customer_Profitability.csv", generateCSV(headers, rows));
+                            }}>Export CSV</Btn>
+                        </div>
+                        <div style={{ overflowX: "auto" }}>
+                            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                                <thead>
+                                    <tr style={{ borderBottom: `1px solid ${T.border}`, background: `${T.surface}88` }}>
+                                        {["#", "Customer", "Revenue", "COGS", "Gross Profit", "Margin %", "Units", "Txns"].map(h => (
+                                            <th key={h} style={{ padding: 12, textAlign: "left", color: T.t3, fontSize: 11 }}>{h}</th>
+                                        ))}
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {customerProfitData.length === 0 ? (
+                                        <tr><td colSpan={8} style={{ padding: 40, textAlign: "center", color: T.t3 }}>No customer sales data available.</td></tr>
+                                    ) : customerProfitData.map((c, i) => (
+                                        <tr key={i} className="row-hover" style={{ borderBottom: `1px solid ${T.border}` }}>
+                                            <td style={{ padding: 12, fontWeight: 800, color: i < 3 ? T.amber : T.t3 }}>{i + 1}</td>
+                                            <td style={{ padding: 12, fontWeight: 700, color: T.t1 }}>{c.name}</td>
+                                            <td style={{ padding: 12, fontFamily: FONT.mono }}>{fmt(c.revenue)}</td>
+                                            <td style={{ padding: 12, fontFamily: FONT.mono, color: T.t3 }}>{fmt(c.cogs)}</td>
+                                            <td style={{ padding: 12, fontFamily: FONT.mono, fontWeight: 800, color: c.grossProfit >= 0 ? T.emerald : T.crimson }}>{fmt(c.grossProfit)}</td>
+                                            <td style={{ padding: 12 }}>
+                                                <span style={{ fontSize: 11, fontWeight: 800, padding: "2px 8px", borderRadius: 4, background: parseFloat(c.marginPct) >= 20 ? `${T.emerald}22` : parseFloat(c.marginPct) >= 10 ? `${T.amber}22` : `${T.crimson}22`, color: parseFloat(c.marginPct) >= 20 ? T.emerald : parseFloat(c.marginPct) >= 10 ? T.amber : T.crimson }}>{c.marginPct}%</span>
+                                            </td>
+                                            <td style={{ padding: 12, fontFamily: FONT.mono }}>{c.qty}</td>
+                                            <td style={{ padding: 12, fontFamily: FONT.mono }}>{c.txnCount}</td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* ===== VENDOR PERFORMANCE ===== */}
+            {view === "vendorPerf" && (
+                <div className="fade-in" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12 }}>
+                        <StatCard label="Total Vendors" value={vendorPerfData.length} color={T.sky} icon="🏭" />
+                        <StatCard label="Total Purchases" value={fmt(vendorPerfData.reduce((s, v) => s + v.totalPurchases, 0))} color={T.amber} icon="📥" />
+                        <StatCard label="Total Returns" value={fmt(vendorPerfData.reduce((s, v) => s + v.returnValue, 0))} color={T.crimson} icon="↩️" />
+                        <StatCard label="Avg Return %" value={(() => { const tq = vendorPerfData.reduce((s, v) => s + v.totalQty, 0); const rq = vendorPerfData.reduce((s, v) => s + v.returnQty, 0); return tq > 0 ? ((rq / tq) * 100).toFixed(1) + "%" : "0%"; })()} color={T.violet} icon="📊" />
+                    </div>
+                    <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 14, overflow: "hidden" }}>
+                        <div style={{ padding: "16px 20px", background: T.surface, borderBottom: `1px solid ${T.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                            <div style={{ fontWeight: 800, color: T.t1 }}>Vendor Performance Summary</div>
+                            <Btn variant="subtle" size="sm" onClick={() => {
+                                const headers = ["Vendor", "Total Purchases", "Orders", "Avg Order Value", "Avg Delivery Gap (days)", "Return Qty", "Return Value", "Return %"];
+                                const rows = vendorPerfData.map(v => [v.name, v.totalPurchases, v.txnCount, v.avgOrderValue, v.avgDeliveryGap, v.returnQty, v.returnValue, v.returnPct + "%"]);
+                                downloadCSV("Vendor_Performance.csv", generateCSV(headers, rows));
+                            }}>Export CSV</Btn>
+                        </div>
+                        <div style={{ overflowX: "auto" }}>
+                            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                                <thead>
+                                    <tr style={{ borderBottom: `1px solid ${T.border}`, background: `${T.surface}88` }}>
+                                        {["Vendor", "Total Purchases", "Orders", "Avg Order Value", "Avg Delivery Gap", "Returns (Qty)", "Return Value", "Return %"].map(h => (
+                                            <th key={h} style={{ padding: 12, textAlign: "left", color: T.t3, fontSize: 11, whiteSpace: "nowrap" }}>{h}</th>
+                                        ))}
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {vendorPerfData.length === 0 ? (
+                                        <tr><td colSpan={8} style={{ padding: 40, textAlign: "center", color: T.t3 }}>No vendor purchase data available.</td></tr>
+                                    ) : vendorPerfData.map((v, i) => (
+                                        <tr key={i} className="row-hover" style={{ borderBottom: `1px solid ${T.border}` }}>
+                                            <td style={{ padding: 12, fontWeight: 700, color: T.t1 }}>{v.name}</td>
+                                            <td style={{ padding: 12, fontFamily: FONT.mono, fontWeight: 700 }}>{fmt(v.totalPurchases)}</td>
+                                            <td style={{ padding: 12, fontFamily: FONT.mono }}>{v.txnCount}</td>
+                                            <td style={{ padding: 12, fontFamily: FONT.mono }}>{fmt(v.avgOrderValue)}</td>
+                                            <td style={{ padding: 12, fontFamily: FONT.mono }}>{v.avgDeliveryGap > 0 ? `${v.avgDeliveryGap} days` : "—"}</td>
+                                            <td style={{ padding: 12, fontFamily: FONT.mono, color: v.returnQty > 0 ? T.crimson : T.t3 }}>{v.returnQty}</td>
+                                            <td style={{ padding: 12, fontFamily: FONT.mono, color: v.returnValue > 0 ? T.crimson : T.t3 }}>{fmt(v.returnValue)}</td>
+                                            <td style={{ padding: 12 }}>
+                                                <span style={{ fontSize: 11, fontWeight: 800, padding: "2px 8px", borderRadius: 4, background: parseFloat(v.returnPct) <= 2 ? `${T.emerald}22` : parseFloat(v.returnPct) <= 5 ? `${T.amber}22` : `${T.crimson}22`, color: parseFloat(v.returnPct) <= 2 ? T.emerald : parseFloat(v.returnPct) <= 5 ? T.amber : T.crimson }}>{v.returnPct}%</span>
+                                            </td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* ===== SLOW / NON-MOVING STOCK ===== */}
+            {view === "slowMoving" && (
+                <div className="fade-in" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12 }}>
+                        <StatCard label="Slow/Non-Moving Items" value={slowMovingData.length} color={T.crimson} icon="🐌" />
+                        <StatCard label="Total Locked Value" value={fmt(slowMovingData.reduce((s, p) => s + p.lockedValue, 0))} color={T.amber} icon="🔒" />
+                        <StatCard label="Total Qty Stuck" value={slowMovingData.reduce((s, p) => s + p.stock, 0)} color={T.sky} icon="📦" />
+                        <StatCard label="% of Inventory" value={shopProducts.length > 0 ? ((slowMovingData.length / shopProducts.filter(p => p.stock > 0).length) * 100).toFixed(0) + "%" : "0%"} color={T.violet} icon="📊" />
+                    </div>
+                    <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 14, overflow: "hidden" }}>
+                        <div style={{ padding: "16px 20px", background: T.surface, borderBottom: `1px solid ${T.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                            <div style={{ fontWeight: 800, color: T.t1 }}>Items with zero/low movement in last {slowDays} days</div>
+                            <Btn variant="subtle" size="sm" onClick={() => {
+                                const headers = ["Product", "SKU", "Category", "Stock", "Buy Price", "Locked Value", "Last Sale", "Days Since Last Sale"];
+                                const rows = slowMovingData.map(p => [p.name, p.sku, p.category, p.stock, p.buyPrice, p.lockedValue, p.lastSaleDate ? fmtDate(p.lastSaleDate) : "Never", p.daysSinceLastSale >= 999 ? "Never" : p.daysSinceLastSale]);
+                                downloadCSV(`Slow_Moving_Stock_${slowDays}days.csv`, generateCSV(headers, rows));
+                            }}>Export CSV</Btn>
+                        </div>
+                        <div style={{ overflowX: "auto" }}>
+                            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                                <thead>
+                                    <tr style={{ borderBottom: `1px solid ${T.border}`, background: `${T.surface}88` }}>
+                                        {["Product", "SKU", "Category", "Stock", "Buy Price", "Locked Value", "Last Sale", "Days Idle"].map(h => (
+                                            <th key={h} style={{ padding: 12, textAlign: "left", color: T.t3, fontSize: 11, whiteSpace: "nowrap" }}>{h}</th>
+                                        ))}
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {slowMovingData.length === 0 ? (
+                                        <tr><td colSpan={8} style={{ padding: 40, textAlign: "center", color: T.t3 }}>No slow-moving items found. All stock is moving well!</td></tr>
+                                    ) : slowMovingData.map((p, i) => (
+                                        <tr key={i} className="row-hover" style={{ borderBottom: `1px solid ${T.border}` }}>
+                                            <td style={{ padding: 12 }}>
+                                                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                                                    <span style={{ fontSize: 20 }}>{p.image}</span>
+                                                    <div>
+                                                        <div style={{ fontWeight: 700, color: T.t1, fontSize: 12 }}>{p.name}</div>
+                                                        <div style={{ fontSize: 10, color: T.t3 }}>{p.brand}</div>
+                                                    </div>
+                                                </div>
+                                            </td>
+                                            <td style={{ padding: 12, fontFamily: FONT.mono, fontSize: 11 }}>{p.sku}</td>
+                                            <td style={{ padding: 12, fontSize: 12 }}>{p.category}</td>
+                                            <td style={{ padding: 12, fontFamily: FONT.mono }}>{p.stock}</td>
+                                            <td style={{ padding: 12, fontFamily: FONT.mono }}>{fmt(p.buyPrice)}</td>
+                                            <td style={{ padding: 12, fontFamily: FONT.mono, fontWeight: 800, color: T.crimson }}>{fmt(p.lockedValue)}</td>
+                                            <td style={{ padding: 12, whiteSpace: "nowrap" }}>{p.lastSaleDate ? fmtDate(p.lastSaleDate) : <span style={{ color: T.crimson, fontWeight: 700 }}>Never sold</span>}</td>
+                                            <td style={{ padding: 12 }}>
+                                                <span style={{ fontSize: 11, fontWeight: 800, padding: "2px 8px", borderRadius: 4, background: p.daysSinceLastSale >= 999 ? `${T.crimson}22` : p.daysSinceLastSale >= 90 ? `${T.crimson}22` : `${T.amber}22`, color: p.daysSinceLastSale >= 90 ? T.crimson : T.amber }}>{p.daysSinceLastSale >= 999 ? "Never" : `${p.daysSinceLastSale}d`}</span>
+                                            </td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                                {slowMovingData.length > 0 && (
+                                    <tfoot>
+                                        <tr style={{ background: T.surface, fontWeight: 900 }}>
+                                            <td colSpan={3} style={{ padding: 16, textAlign: "right" }}>Total Locked Capital:</td>
+                                            <td style={{ padding: 16, fontFamily: FONT.mono }}>{slowMovingData.reduce((s, p) => s + p.stock, 0)}</td>
+                                            <td style={{ padding: 16 }}></td>
+                                            <td style={{ padding: 16, fontFamily: FONT.mono, color: T.crimson, fontSize: 16 }}>{fmt(slowMovingData.reduce((s, p) => s + p.lockedValue, 0))}</td>
+                                            <td colSpan={2}></td>
+                                        </tr>
+                                    </tfoot>
+                                )}
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* ===== COST CENTRE-WISE P&L ===== */}
+            {view === "ccPnl" && (() => {
+                const costCentres = (() => { try { return JSON.parse(localStorage.getItem("vl_cost_centres") || "[]"); } catch { return []; } })();
+                const manualJournals = (() => { try { return JSON.parse(localStorage.getItem("vl_manual_journals") || "[]"); } catch { return []; } })();
+                const autoEntries = generateJournalEntries(movements, products, parties, activeShopId);
+                const allEntries = [...autoEntries, ...manualJournals];
+                const fromTs = new Date(reportDateFrom).getTime();
+                const toTs = new Date(reportDateTo).getTime() + 86400000 - 1;
+                const ccPnl = computeCostCentrePnL(allEntries, costCentres, fromTs, toTs);
+
+                return (
+                    <div className="fade-in" style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+                        {costCentres.length === 0 ? (
+                            <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 14, padding: 60, textAlign: "center" }}>
+                                <div style={{ fontSize: 48, marginBottom: 16 }}>🏢</div>
+                                <div style={{ fontSize: 18, fontWeight: 800, color: T.t1, marginBottom: 8 }}>No Cost Centres</div>
+                                <div style={{ color: T.t3, fontSize: 14 }}>Create cost centres in Accounting → Cost Centres tab first, then tag journal entries to see department-wise P&L here.</div>
+                            </div>
+                        ) : (
+                            <>
+                                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 12 }}>
+                                    {ccPnl.map(cc => (
+                                        <div key={cc.id} style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 14, padding: 16, borderLeft: `3px solid ${cc.netProfit >= 0 ? T.emerald : T.crimson}` }}>
+                                            <div style={{ fontSize: 15, fontWeight: 800, color: T.t1, marginBottom: 12 }}>{cc.name}</div>
+                                            <div style={{ marginBottom: 8 }}>
+                                                <div style={{ fontSize: 11, fontWeight: 700, color: T.emerald, marginBottom: 4 }}>Revenue</div>
+                                                {cc.revenue.length === 0 ? <div style={{ fontSize: 11, color: T.t4 }}>—</div> : cc.revenue.map(r => (
+                                                    <div key={r.code} style={{ display: "flex", justifyContent: "space-between", padding: "2px 0" }}>
+                                                        <span style={{ fontSize: 11, color: T.t2 }}>{r.name}</span>
+                                                        <span style={{ fontFamily: FONT.mono, fontSize: 11, color: T.emerald }}>{fmt(r.amount)}</span>
+                                                    </div>
+                                                ))}
+                                                <div style={{ display: "flex", justifyContent: "space-between", borderTop: `1px solid ${T.border}`, padding: "4px 0", marginTop: 4, fontWeight: 700 }}>
+                                                    <span style={{ fontSize: 12 }}>Total</span>
+                                                    <span style={{ fontFamily: FONT.mono, fontSize: 12, color: T.emerald }}>{fmt(cc.totalRevenue)}</span>
+                                                </div>
+                                            </div>
+                                            <div style={{ marginBottom: 8 }}>
+                                                <div style={{ fontSize: 11, fontWeight: 700, color: T.crimson, marginBottom: 4 }}>Expenses</div>
+                                                {cc.expenses.length === 0 ? <div style={{ fontSize: 11, color: T.t4 }}>—</div> : cc.expenses.map(e => (
+                                                    <div key={e.code} style={{ display: "flex", justifyContent: "space-between", padding: "2px 0" }}>
+                                                        <span style={{ fontSize: 11, color: T.t2 }}>{e.name}</span>
+                                                        <span style={{ fontFamily: FONT.mono, fontSize: 11, color: T.crimson }}>{fmt(e.amount)}</span>
+                                                    </div>
+                                                ))}
+                                                <div style={{ display: "flex", justifyContent: "space-between", borderTop: `1px solid ${T.border}`, padding: "4px 0", marginTop: 4, fontWeight: 700 }}>
+                                                    <span style={{ fontSize: 12 }}>Total</span>
+                                                    <span style={{ fontFamily: FONT.mono, fontSize: 12, color: T.crimson }}>{fmt(cc.totalExpenses)}</span>
+                                                </div>
+                                            </div>
+                                            <div style={{ display: "flex", justifyContent: "space-between", padding: "8px 0", borderTop: `2px solid ${T.border}`, fontWeight: 800 }}>
+                                                <span style={{ fontSize: 13 }}>Net {cc.netProfit >= 0 ? "Profit" : "Loss"}</span>
+                                                <span style={{ fontFamily: FONT.mono, fontSize: 15, color: cc.netProfit >= 0 ? T.emerald : T.crimson }}>{cc.netProfit >= 0 ? fmt(cc.netProfit) : "(" + fmt(Math.abs(cc.netProfit)) + ")"}</span>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                                {ccPnl.length > 0 && (
+                                    <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 14, overflow: "hidden" }}>
+                                        <div style={{ padding: "16px 20px", background: T.surface, borderBottom: `1px solid ${T.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                                            <div style={{ fontWeight: 800, color: T.t1 }}>Summary Comparison</div>
+                                            <Btn variant="subtle" size="sm" onClick={() => {
+                                                const headers = ["Cost Centre", "Revenue", "Expenses", "Net Profit"];
+                                                const rows = ccPnl.map(cc => [cc.name, cc.totalRevenue, cc.totalExpenses, cc.netProfit]);
+                                                downloadCSV(`CostCentre_PnL_${reportDateFrom}_to_${reportDateTo}.csv`, generateCSV(headers, rows));
+                                            }}>Export CSV</Btn>
+                                        </div>
+                                        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                                            <thead>
+                                                <tr style={{ borderBottom: `1px solid ${T.border}`, background: `${T.surface}88` }}>
+                                                    {["Cost Centre", "Revenue", "Expenses", "Net P/L", "Margin %"].map(h => (
+                                                        <th key={h} style={{ padding: 12, textAlign: h === "Cost Centre" ? "left" : "right", color: T.t3, fontSize: 11 }}>{h}</th>
+                                                    ))}
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                {ccPnl.map((cc, i) => (
+                                                    <tr key={cc.id} style={{ borderBottom: `1px solid ${T.border}`, background: i % 2 === 0 ? T.card : T.surface }}>
+                                                        <td style={{ padding: 12, fontWeight: 700 }}>{cc.name}</td>
+                                                        <td style={{ padding: 12, textAlign: "right", fontFamily: FONT.mono, color: T.emerald }}>{fmt(cc.totalRevenue)}</td>
+                                                        <td style={{ padding: 12, textAlign: "right", fontFamily: FONT.mono, color: T.crimson }}>{fmt(cc.totalExpenses)}</td>
+                                                        <td style={{ padding: 12, textAlign: "right", fontFamily: FONT.mono, fontWeight: 700, color: cc.netProfit >= 0 ? T.emerald : T.crimson }}>{cc.netProfit >= 0 ? fmt(cc.netProfit) : "(" + fmt(Math.abs(cc.netProfit)) + ")"}</td>
+                                                        <td style={{ padding: 12, textAlign: "right", fontFamily: FONT.mono, color: T.t2 }}>{cc.totalRevenue > 0 ? ((cc.netProfit / cc.totalRevenue) * 100).toFixed(1) + "%" : "—"}</td>
+                                                    </tr>
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                )}
+                            </>
+                        )}
+                    </div>
+                );
+            })()}
 
             {/* ===== AUDIT LOG ===== */}
             {view === "audit" && (

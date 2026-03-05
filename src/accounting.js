@@ -809,6 +809,47 @@ export function computeCostSheet(movements, products, activeShopId, startDate, e
   };
 }
 
+export function computeCostCentrePnL(journalEntries, costCentres, startDate, endDate) {
+  const ccMap = {};
+  (costCentres || []).forEach(cc => {
+    ccMap[cc.id] = { id: cc.id, name: cc.name, revenue: {}, expenses: {}, totalRevenue: 0, totalExpenses: 0, netProfit: 0 };
+  });
+  ccMap["__unallocated__"] = { id: "__unallocated__", name: "Unallocated", revenue: {}, expenses: {}, totalRevenue: 0, totalExpenses: 0, netProfit: 0 };
+
+  const incomeSet = new Set(CHART_OF_ACCOUNTS.filter(a => a.type === "INCOME").map(a => a.code));
+  const expenseSet = new Set(CHART_OF_ACCOUNTS.filter(a => a.type === "EXPENSE").map(a => a.code));
+
+  (journalEntries || []).forEach(je => {
+    if (startDate && je.date < startDate) return;
+    if (endDate && je.date > endDate) return;
+    const ccId = je.costCentre || "__unallocated__";
+    if (!ccMap[ccId]) ccMap[ccId] = { id: ccId, name: ccId, revenue: {}, expenses: {}, totalRevenue: 0, totalExpenses: 0, netProfit: 0 };
+    je.entries.forEach(e => {
+      if (incomeSet.has(e.accountCode)) {
+        const amt = (e.credit || 0) - (e.debit || 0);
+        if (!ccMap[ccId].revenue[e.accountCode]) ccMap[ccId].revenue[e.accountCode] = { code: e.accountCode, name: e.accountName, amount: 0 };
+        ccMap[ccId].revenue[e.accountCode].amount += amt;
+        ccMap[ccId].totalRevenue += amt;
+      }
+      if (expenseSet.has(e.accountCode)) {
+        const amt = (e.debit || 0) - (e.credit || 0);
+        if (!ccMap[ccId].expenses[e.accountCode]) ccMap[ccId].expenses[e.accountCode] = { code: e.accountCode, name: e.accountName, amount: 0 };
+        ccMap[ccId].expenses[e.accountCode].amount += amt;
+        ccMap[ccId].totalExpenses += amt;
+      }
+    });
+  });
+
+  const results = Object.values(ccMap).map(cc => ({
+    ...cc,
+    revenue: Object.values(cc.revenue).filter(r => r.amount !== 0),
+    expenses: Object.values(cc.expenses).filter(e => e.amount !== 0),
+    netProfit: cc.totalRevenue - cc.totalExpenses,
+  })).filter(cc => cc.totalRevenue !== 0 || cc.totalExpenses !== 0);
+
+  return results;
+}
+
 export function computeOutstandingAging(movements, parties, activeShopId) {
   const shopMovements = activeShopId
     ? (movements || []).filter(m => m.shopId === activeShopId)

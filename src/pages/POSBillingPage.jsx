@@ -15,8 +15,11 @@ import { Modal, Field, Input, Select, Divider, Btn } from "../components/ui";
  *   - Save as Sale or Quotation (no stock deduction)
  *   - Thermal-print-ready invoice preview
  */
-export function POSBillingPage({ products, activeShopId, onMultiSale, toast }) {
+export function POSBillingPage({ products, parties, movements, activeShopId, onMultiSale, toast, activeStaffMember, onSwitchStaff, onStaffLogout, staffHasPermission }) {
+    const canViewMargin = !staffHasPermission || staffHasPermission("can_view_margin");
     const shopProducts = useMemo(() => products.filter(p => p.shopId === activeShopId && p.isActive !== false), [products, activeShopId]);
+    const shopParties = useMemo(() => (parties || []).filter(p => p.shopId === activeShopId), [parties, activeShopId]);
+    const shopMovements = useMemo(() => (movements || []).filter(m => m.shopId === activeShopId), [movements, activeShopId]);
     const companyInfo = getCompanyInfo();
 
     const [billType, setBillType] = useState("Sale");
@@ -38,6 +41,7 @@ export function POSBillingPage({ products, activeShopId, onMultiSale, toast }) {
     });
     const [showHeldList, setShowHeldList] = useState(false);
     const [showHelp, setShowHelp] = useState(false);
+    const [creditLimitWarning, setCreditLimitWarning] = useState(null);
 
     const persistHeld = useCallback((list) => {
         setHeldInvoices(list);
@@ -133,12 +137,57 @@ export function POSBillingPage({ products, activeShopId, onMultiSale, toast }) {
     // Payment
     const isUdhaar = paymentMode === "Udhaar";
 
+    const getCustomerOutstanding = useCallback((name) => {
+        if (!name) return 0;
+        const party = shopParties.find(p => p.name === name && (p.type === "customer" || p.type === "both"));
+        if (!party) return 0;
+        let balance = party.openingBalance || 0;
+        shopMovements.forEach(m => {
+            if (m.customerName === name && m.type === "SALE" && (m.paymentStatus === "pending" || m.paymentStatus === "partial")) {
+                balance += (m.total || 0) - (m.paidAmount || 0);
+            }
+            if (m.type === "RECEIPT" && m.customerName === name && !m.allocations?.length) balance -= m.total;
+        });
+        return balance;
+    }, [shopParties, shopMovements]);
+
+    const getCustomerCreditLimit = useCallback((name) => {
+        if (!name) return 0;
+        const party = shopParties.find(p => p.name === name && (p.type === "customer" || p.type === "both"));
+        return party?.creditLimit || 0;
+    }, [shopParties]);
+
+    const getCustomerPaymentTerms = useCallback((name) => {
+        if (!name) return null;
+        const party = shopParties.find(p => p.name === name && (p.type === "customer" || p.type === "both"));
+        return party?.paymentTerms || null;
+    }, [shopParties]);
+
     // Validation
     const validate = () => {
         if (items.length === 0) { toast?.("Add at least one product to the bill", "warning"); return false; }
         for (const item of items) {
             if (item.qty <= 0) { toast?.(`Invalid quantity for ${item.name}`, "warning"); return false; }
             if (billType === "Sale" && item.qty > item.maxStock) { toast?.(`Only ${item.maxStock} units of ${item.name} in stock`, "warning"); return false; }
+        }
+
+        if (isUdhaar && customerName) {
+            const creditLimit = getCustomerCreditLimit(customerName);
+            if (creditLimit > 0) {
+                const outstanding = getCustomerOutstanding(customerName);
+                const newTotal = outstanding + grandTotal;
+                if (newTotal > creditLimit) {
+                    setCreditLimitWarning({
+                        customerName,
+                        creditLimit,
+                        outstanding,
+                        newInvoice: grandTotal,
+                        newTotal,
+                        excess: newTotal - creditLimit,
+                    });
+                    return false;
+                }
+            }
         }
 
         return true;
@@ -197,9 +246,66 @@ export function POSBillingPage({ products, activeShopId, onMultiSale, toast }) {
         setShowInvoice(true);
     }, [items, lineCalcs, billType, isUdhaar, paymentMode, grandTotal, grandSubtotal, grandDiscount, grandGst, grandProfit, customerName, customerPhone, vehicleReg, mechanic, notes, onMultiSale]);
 
+    const handleForceSubmit = useCallback(async () => {
+        setCreditLimitWarning(null);
+        setSaving(true);
+        await new Promise(r => setTimeout(r, 300));
+
+        const inv = getNextVoucherNumber(billType === "Sale" ? "SALE" : "ESTIMATE");
+        setInvoiceNo(inv);
+
+        const finalPayments = { [isUdhaar ? "Credit" : paymentMode]: grandTotal };
+
+        onMultiSale({
+            type: billType,
+            invoiceNo: inv,
+            items: items.map((item, idx) => {
+                const isOverridden = item.price !== item.originalPrice && item.originalPrice > 0;
+                const priceOverride = isOverridden ? {
+                    originalPrice: item.originalPrice,
+                    overriddenPrice: item.price,
+                    difference: item.price - item.originalPrice,
+                    percentChange: +((item.price - item.originalPrice) / item.originalPrice * 100).toFixed(1),
+                    reason: item.priceOverrideReason || "",
+                    overriddenBy: "shopOwner",
+                    overriddenAt: Date.now(),
+                } : null;
+                return {
+                    productId: item.productId,
+                    name: item.name,
+                    qty: item.qty,
+                    sellPrice: item.price,
+                    buyPrice: item.buyPrice,
+                    discount: lineCalcs[idx].discAmt,
+                    total: lineCalcs[idx].afterDisc,
+                    gstAmount: lineCalcs[idx].gstAmt,
+                    profit: lineCalcs[idx].profit,
+                    gstRate: item.gstRate,
+                    ...(priceOverride && { priceOverride }),
+                };
+            }),
+            customerName, customerPhone, vehicleReg, mechanic, notes,
+            payments: finalPayments,
+            paymentMode,
+            subtotal: grandSubtotal,
+            discount: grandDiscount,
+            total: grandTotal,
+            gstAmount: grandGst,
+            profit: grandProfit,
+            date: Date.now(),
+            creditLimitOverride: true,
+            staffId: activeStaffMember?.id || null,
+            staffName: activeStaffMember?.name || null,
+        });
+
+        setSaving(false);
+        setShowInvoice(true);
+    }, [items, lineCalcs, billType, isUdhaar, paymentMode, grandTotal, grandSubtotal, grandDiscount, grandGst, grandProfit, customerName, customerPhone, vehicleReg, mechanic, notes, onMultiSale]);
+
     const newBill = useCallback(() => {
         setItems([]); setCustomerName(""); setCustomerPhone(""); setVehicleReg(""); setMechanic(""); setNotes("");
         setPaymentMode("Cash"); setShowInvoice(false); setSearch(""); setShowHeldList(false); setShowHelp(false);
+        setCreditLimitWarning(null);
         if (searchRef.current) searchRef.current.focus();
     }, []);
 
@@ -295,6 +401,14 @@ export function POSBillingPage({ products, activeShopId, onMultiSale, toast }) {
                     <div style={{ fontSize: 12, color: T.t3, marginTop: 2 }}>Multi-item invoice with payment splitting</div>
                 </div>
                 <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                    {activeStaffMember && (
+                        <div style={{ display: "flex", alignItems: "center", gap: 6, background: T.emeraldBg, border: `1px solid ${T.emerald}33`, borderRadius: 8, padding: "5px 10px", fontSize: 11, fontWeight: 700, color: T.emerald }}>
+                            🟢 {activeStaffMember.name}
+                        </div>
+                    )}
+                    <button onClick={onSwitchStaff} style={{ background: T.surface, border: `1px solid ${T.amber}44`, borderRadius: 8, padding: "6px 10px", cursor: "pointer", fontSize: 11, fontWeight: 700, color: T.amber, fontFamily: FONT.ui, display: "flex", alignItems: "center", gap: 4 }}>
+                        👤 {activeStaffMember ? "Switch Staff" : "Staff Login"}
+                    </button>
                     <button onClick={() => setShowHelp(true)} style={{ background: T.surface, border: `1px solid ${T.border}`, borderRadius: 8, padding: "6px 10px", cursor: "pointer", fontSize: 11, fontWeight: 700, color: T.t3, fontFamily: FONT.ui, display: "flex", alignItems: "center", gap: 4 }}>
                         <span style={{ fontSize: 13 }}>⌨</span> F1
                     </button>
@@ -341,7 +455,7 @@ export function POSBillingPage({ products, activeShopId, onMultiSale, toast }) {
                                 </div>
                                 <div style={{ textAlign: "right" }}>
                                     <div style={{ fontFamily: FONT.mono, fontWeight: 800, color: T.amber, fontSize: 15 }}>{fmt(p.sellPrice)}</div>
-                                    <div style={{ fontSize: 10, color: T.t3 }}>Margin: {margin(p.buyPrice, p.sellPrice)}%</div>
+                                    {canViewMargin && <div style={{ fontSize: 10, color: T.t3 }}>Margin: {margin(p.buyPrice, p.sellPrice)}%</div>}
                                 </div>
                                 {items.some(i => i.productId === p.id) && <span style={{ background: T.emeraldBg, color: T.emerald, fontSize: 10, padding: "2px 8px", borderRadius: 20, fontWeight: 800 }}>Added</span>}
                             </button>
@@ -362,7 +476,7 @@ export function POSBillingPage({ products, activeShopId, onMultiSale, toast }) {
                     <table style={{ width: "100%", borderCollapse: "collapse" }}>
                         <thead>
                             <tr style={{ background: T.surface, borderBottom: `1px solid ${T.border}` }}>
-                                {["#", "Product", "Qty", "Rate (₹)", "Disc", "GST", "Total", "Profit", ""].map(h => (
+                                {["#", "Product", "Qty", "Rate (₹)", "Disc", "GST", "Total", ...(canViewMargin ? ["Profit"] : []), ""].map(h => (
                                     <th key={h} style={{ padding: "10px 12px", textAlign: "left", color: T.t3, fontWeight: 600, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.07em", fontFamily: FONT.ui }}>{h}</th>
                                 ))}
                             </tr>
@@ -404,7 +518,7 @@ export function POSBillingPage({ products, activeShopId, onMultiSale, toast }) {
                                         </td>
                                         <td style={{ padding: "10px 8px", fontFamily: FONT.mono, fontSize: 11, color: T.t3 }}>{item.gstRate}%</td>
                                         <td style={{ padding: "10px 12px", fontFamily: FONT.mono, fontWeight: 800, fontSize: 14, color: T.t1 }}>{fmt(lc.afterDisc)}</td>
-                                        <td style={{ padding: "10px 12px", fontFamily: FONT.mono, fontWeight: 700, fontSize: 13, color: lc.profit >= 0 ? T.emerald : T.crimson }}>{lc.profit >= 0 ? "+" : ""}{fmt(lc.profit)}</td>
+                                        {canViewMargin && <td style={{ padding: "10px 12px", fontFamily: FONT.mono, fontWeight: 700, fontSize: 13, color: lc.profit >= 0 ? T.emerald : T.crimson }}>{lc.profit >= 0 ? "+" : ""}{fmt(lc.profit)}</td>}
                                         <td style={{ padding: "10px 8px" }}>
                                             <button onClick={() => removeItem(idx)} style={{ background: "transparent", border: "none", color: T.crimson, cursor: "pointer", fontSize: 16, padding: 4 }}>✕</button>
                                         </td>
@@ -454,11 +568,12 @@ export function POSBillingPage({ products, activeShopId, onMultiSale, toast }) {
                                 <span style={{ fontSize: 17, fontWeight: 900, color: T.t1 }}>TOTAL</span>
                                 <span style={{ fontSize: 22, fontWeight: 900, fontFamily: FONT.mono, color: T.sky }}>{fmt(grandTotal)}</span>
                             </div>
-                            {/* Profit */}
+                            {canViewMargin && (
                             <div style={{ display: "flex", justifyContent: "space-between", marginTop: 10, paddingTop: 8, borderTop: `1px dashed ${T.border}` }}>
                                 <span style={{ fontSize: 12, color: T.t3 }}>Net Profit</span>
                                 <span style={{ fontFamily: FONT.mono, fontWeight: 800, fontSize: 16, color: grandProfit >= 0 ? T.emerald : T.crimson }}>{grandProfit >= 0 ? "+" : ""}{fmt(grandProfit)}</span>
                             </div>
+                            )}
                         </div>
 
                         {/* Payment */}
@@ -487,9 +602,53 @@ export function POSBillingPage({ products, activeShopId, onMultiSale, toast }) {
                                 })}
                             </div>
                             {isUdhaar && (
-                                <div style={{ background: `${T.crimson}15`, border: `1px solid ${T.crimson}44`, padding: "10px 14px", borderRadius: 8, display: "flex", alignItems: "center", gap: 10 }}>
-                                    <span style={{ fontSize: 16 }}>⚠️</span>
-                                    <div style={{ fontSize: 12, color: T.crimson, fontWeight: 600 }}>Full amount of {fmt(grandTotal)} will be added to credit ledger</div>
+                                <div>
+                                    <div style={{ background: `${T.crimson}15`, border: `1px solid ${T.crimson}44`, padding: "10px 14px", borderRadius: 8, display: "flex", alignItems: "center", gap: 10 }}>
+                                        <span style={{ fontSize: 16 }}>⚠️</span>
+                                        <div style={{ fontSize: 12, color: T.crimson, fontWeight: 600 }}>Full amount of {fmt(grandTotal)} will be added to credit ledger</div>
+                                    </div>
+                                    {customerName && (() => {
+                                        const creditLimit = getCustomerCreditLimit(customerName);
+                                        const outstanding = getCustomerOutstanding(customerName);
+                                        const payTerms = getCustomerPaymentTerms(customerName);
+                                        if (creditLimit <= 0 && !payTerms) return null;
+                                        const newTotal = outstanding + grandTotal;
+                                        const utilPct = creditLimit > 0 ? Math.min((newTotal / creditLimit) * 100, 100) : 0;
+                                        const isOverLimit = creditLimit > 0 && newTotal > creditLimit;
+                                        return (
+                                            <div style={{ marginTop: 8, background: T.surface, border: `1px solid ${isOverLimit ? T.crimson + "66" : T.border}`, borderRadius: 8, padding: "10px 14px" }}>
+                                                <div style={{ fontSize: 11, fontWeight: 700, color: T.t3, marginBottom: 6 }}>Credit Status: {customerName}</div>
+                                                {creditLimit > 0 && (
+                                                    <>
+                                                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 4 }}>
+                                                            <span style={{ color: T.t3 }}>Outstanding</span>
+                                                            <span style={{ fontFamily: FONT.mono, fontWeight: 700, color: T.crimson }}>{fmt(outstanding)}</span>
+                                                        </div>
+                                                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 4 }}>
+                                                            <span style={{ color: T.t3 }}>+ This Invoice</span>
+                                                            <span style={{ fontFamily: FONT.mono, fontWeight: 700, color: T.amber }}>{fmt(grandTotal)}</span>
+                                                        </div>
+                                                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 6, paddingTop: 4, borderTop: `1px dashed ${T.border}` }}>
+                                                            <span style={{ color: T.t3 }}>New Total</span>
+                                                            <span style={{ fontFamily: FONT.mono, fontWeight: 800, color: isOverLimit ? T.crimson : T.t1 }}>{fmt(newTotal)} / {fmt(creditLimit)}</span>
+                                                        </div>
+                                                        <div style={{ width: "100%", height: 6, background: T.border, borderRadius: 3, overflow: "hidden" }}>
+                                                            <div style={{ width: `${utilPct}%`, height: "100%", background: isOverLimit ? T.crimson : utilPct > 80 ? T.amber : T.emerald, transition: "width 0.3s" }} />
+                                                        </div>
+                                                        {isOverLimit && (
+                                                            <div style={{ fontSize: 10, color: T.crimson, fontWeight: 700, marginTop: 4 }}>Exceeds credit limit by {fmt(newTotal - creditLimit)}</div>
+                                                        )}
+                                                    </>
+                                                )}
+                                                {payTerms && (
+                                                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginTop: creditLimit > 0 ? 6 : 0 }}>
+                                                        <span style={{ color: T.t3 }}>Payment Terms</span>
+                                                        <span style={{ fontWeight: 700, color: T.sky }}>{payTerms}</span>
+                                                    </div>
+                                                )}
+                                            </div>
+                                        );
+                                    })()}
                                 </div>
                             )}
                         </div>
@@ -591,6 +750,45 @@ export function POSBillingPage({ products, activeShopId, onMultiSale, toast }) {
                                 })}
                             </div>
                         )}
+                    </div>
+                </div>
+            )}
+
+            {creditLimitWarning && (
+                <div className="backdrop-in" onClick={() => setCreditLimitWarning(null)} style={{ position: "fixed", inset: 0, zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.6)", backdropFilter: "blur(4px)" }}>
+                    <div className="modal-in" onClick={e => e.stopPropagation()} style={{ background: T.card, border: `1px solid ${T.crimson}44`, borderRadius: 16, width: 440, padding: 24, boxShadow: "0 20px 50px rgba(0,0,0,0.5)" }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
+                            <span style={{ fontSize: 32 }}>🚫</span>
+                            <div>
+                                <div style={{ fontSize: 18, fontWeight: 900, color: T.crimson }}>Credit Limit Exceeded</div>
+                                <div style={{ fontSize: 12, color: T.t3, marginTop: 2 }}>{creditLimitWarning.customerName}</div>
+                            </div>
+                        </div>
+                        <div style={{ background: T.surface, border: `1px solid ${T.border}`, borderRadius: 10, padding: 14, marginBottom: 16 }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 8 }}>
+                                <span style={{ color: T.t3 }}>Credit Limit</span>
+                                <span style={{ fontFamily: FONT.mono, fontWeight: 800, color: T.t1 }}>{fmt(creditLimitWarning.creditLimit)}</span>
+                            </div>
+                            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 8 }}>
+                                <span style={{ color: T.t3 }}>Current Outstanding</span>
+                                <span style={{ fontFamily: FONT.mono, fontWeight: 700, color: T.crimson }}>{fmt(creditLimitWarning.outstanding)}</span>
+                            </div>
+                            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 8 }}>
+                                <span style={{ color: T.t3 }}>This Invoice</span>
+                                <span style={{ fontFamily: FONT.mono, fontWeight: 700, color: T.amber }}>{fmt(creditLimitWarning.newInvoice)}</span>
+                            </div>
+                            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, paddingTop: 8, borderTop: `1px solid ${T.border}` }}>
+                                <span style={{ color: T.t3 }}>New Total</span>
+                                <span style={{ fontFamily: FONT.mono, fontWeight: 900, color: T.crimson }}>{fmt(creditLimitWarning.newTotal)}</span>
+                            </div>
+                            <div style={{ marginTop: 8, padding: "6px 10px", background: `${T.crimson}15`, borderRadius: 6, fontSize: 12, fontWeight: 700, color: T.crimson, textAlign: "center" }}>
+                                Exceeds limit by {fmt(creditLimitWarning.excess)}
+                            </div>
+                        </div>
+                        <div style={{ display: "flex", gap: 10 }}>
+                            <Btn variant="ghost" full onClick={() => setCreditLimitWarning(null)}>Cancel</Btn>
+                            <Btn variant="amber" full onClick={handleForceSubmit} style={{ background: `${T.crimson}22`, borderColor: T.crimson, color: T.crimson }}>⚠ Override & Proceed</Btn>
+                        </div>
                     </div>
                 </div>
             )}

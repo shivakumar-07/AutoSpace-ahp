@@ -22,6 +22,7 @@ export function useStoreProvider() {
     const [rfqs, setRfqs] = useState(null);
     const [vendors, setVendors] = useState(null);
     const [purchaseOrders, setPurchaseOrders] = useState(null);
+    const [grns, setGrns] = useState(null);
     const [staff, setStaff] = useState(null);
     const [notifPrefs, setNotifPrefs] = useState({
         ORDER_NEW: true,
@@ -68,6 +69,7 @@ export function useStoreProvider() {
                 const storedNotifications = localStorage.getItem("vl_notifications");
                 const storedNotifPrefs = localStorage.getItem("vl_notif_prefs");
                 const storedWishlist = localStorage.getItem("vl_wishlist");
+                const storedGrns = localStorage.getItem("vl_grns");
                 const storedStaff = localStorage.getItem("vl_staff");
 
                 setShops(storedShops ? JSON.parse(storedShops) : SEED_SHOPS);
@@ -85,6 +87,7 @@ export function useStoreProvider() {
                 setRfqs(storedRfqs ? JSON.parse(storedRfqs) : []);
                 setVendors(storedVendors ? JSON.parse(storedVendors) : []);
                 setPurchaseOrders(storedPurchaseOrders ? JSON.parse(storedPurchaseOrders) : []);
+                setGrns(storedGrns ? JSON.parse(storedGrns) : []);
                 setGarage(storedGarage ? JSON.parse(storedGarage) : []);
                 setReminders(storedReminders ? JSON.parse(storedReminders) : []);
 
@@ -150,6 +153,7 @@ export function useStoreProvider() {
     const saveRfqs = useCallback(d => { setRfqs(d); try { localStorage.setItem("vl_rfqs", JSON.stringify(d)); } catch { } }, []);
     const saveVendors = useCallback(d => { setVendors(d); try { localStorage.setItem("vl_vendors", JSON.stringify(d)); } catch { } }, []);
     const savePurchaseOrders = useCallback(d => { setPurchaseOrders(d); try { localStorage.setItem("vl_purchase_orders", JSON.stringify(d)); } catch { } }, []);
+    const saveGrns = useCallback(d => { setGrns(d); try { localStorage.setItem("vl_grns", JSON.stringify(d)); } catch { } }, []);
     const saveStaff = useCallback(d => { setStaff(d); try { localStorage.setItem("vl_staff", JSON.stringify(d)); } catch { } }, []);
     const saveReviews = useCallback(d => { setReviews(d); try { localStorage.setItem("vl_reviews", JSON.stringify(d)); } catch { } }, []);
     const saveReturns = useCallback(d => { setReturns(d); try { localStorage.setItem("vl_returns", JSON.stringify(d)); } catch { } }, []);
@@ -208,9 +212,9 @@ export function useStoreProvider() {
 
     return {
         shops, products, movements, orders, purchases, auditLog, receipts, parties, vehicles, jobCards, reviews, returns, garage, reminders,
-        rfqs, vendors, purchaseOrders, staff, wishlist, notifications, notifPrefs,
+        rfqs, vendors, purchaseOrders, grns, staff, wishlist, notifications, notifPrefs,
         saveShops, saveProducts, saveMovements, saveOrders, savePurchases, saveAuditLog, saveReceipts, saveParties, saveVehicles, saveJobCards, saveReviews, saveReturns, saveGarage, saveReminders,
-        saveRfqs, saveVendors, savePurchaseOrders, saveStaff, saveWishlist, saveNotifications, saveNotifPrefs,
+        saveRfqs, saveVendors, savePurchaseOrders, saveGrns, saveStaff, saveWishlist, saveNotifications, saveNotifPrefs,
         cart, saveCart, isCartOpen, setIsCartOpen, toggleCart,
         wishlist, saveWishlist, isWishlistOpen, setIsWishlistOpen, toggleWishlist,
         selectedVehicle, saveVehicle,

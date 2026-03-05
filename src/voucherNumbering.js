@@ -10,6 +10,8 @@ const VOUCHER_PREFIXES = {
   CREDIT_NOTE: "CN",
   DEBIT_NOTE: "DN",
   CONTRA: "CON",
+  SO: "SO",
+  DN: "DN",
 };
 
 function getCurrentFinancialYear(date) {

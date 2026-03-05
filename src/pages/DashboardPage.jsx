@@ -186,7 +186,26 @@ export function DashboardPage({ products, movements, orders, activeShopId, onNav
       alerts.push({ id: "top_seller", icon: "🏆", text: `Top seller: ${topProd?.name || 'Item'} — ${salesMap[topId]} units this week. Restock soon?`, severity: T.emerald });
     }
 
-    // 5. Best margin
+    // 5. Recurring invoices due
+    try {
+      const riData = localStorage.getItem("vl_recurring_invoices");
+      if (riData) {
+        const ris = JSON.parse(riData);
+        const RECURRENCE_DAYS_MAP = { monthly: 30, quarterly: 90, half_yearly: 182, yearly: 365 };
+        const dueCount = ris.filter(ri => {
+          if (!ri.isActive || ri.shopId !== activeShopId) return false;
+          if (ri.endDate && currentTime > ri.endDate) return false;
+          const intervalMs = (RECURRENCE_DAYS_MAP[ri.recurrence] || 30) * 86400000;
+          const nextDue = ri.lastGeneratedDate ? ri.lastGeneratedDate + intervalMs : ri.startDate || ri.createdAt;
+          return currentTime >= nextDue;
+        }).length;
+        if (dueCount > 0) {
+          alerts.push({ id: "recurring_due", icon: "🔄", text: `${dueCount} recurring invoice(s) are due for generation. Go to Sales Docs → Recurring.`, severity: T.amber });
+        }
+      }
+    } catch {}
+
+    // 6. Best margin
     const bestMarginProd = [...shopProducts].sort((a,b) => ((b.sellPrice - b.buyPrice)/b.buyPrice) - ((a.sellPrice - a.buyPrice)/a.buyPrice))[0];
     if (bestMarginProd) {
       const mg = ((bestMarginProd.sellPrice - bestMarginProd.buyPrice) / bestMarginProd.buyPrice * 100).toFixed(1);

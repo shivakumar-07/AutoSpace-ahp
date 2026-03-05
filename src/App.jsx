@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useMemo } from "react";
 import { T, FONT, GLOBAL_CSS } from "./theme";
 import { fmt, uid, normalizeOrderStatus } from "./utils";
 import { getNextVoucherNumber } from "./voucherNumbering";
@@ -23,6 +23,8 @@ import StaffManagementPage from "./pages/StaffManagementPage";
 import { AccountingPage } from "./pages/AccountingPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { PurchaseEntryPage } from "./pages/PurchaseEntryPage";
+import { SalesDocumentsPage } from "./pages/SalesDocumentsPage";
+import { MastersPage } from "./pages/MastersPage";
 
 // Marketplace
 import { MarketplaceHome } from "./marketplace/pages/MarketplaceHome";
@@ -46,6 +48,8 @@ const NAV_ITEMS = [
   { key: "orders", icon: "◎", label: "Orders", shortcut: "O" },
   { key: "rfq", icon: "🤝", label: "RFQ / Procurement", shortcut: "Q" },
   { key: "purchase", icon: "📥", label: "Purchase", shortcut: "U" },
+  { key: "salesdocs", icon: "📄", label: "Sales Docs", shortcut: "L" },
+  { key: "masters", icon: "📋", label: "Masters", shortcut: "M" },
   { key: "accounting", icon: "📒", label: "Accounting", shortcut: "C" },
   { key: "settings", icon: "⚙️", label: "Settings", shortcut: "S" },
 ];
@@ -57,8 +61,8 @@ export default function App() {
     auditLog, receipts, saveReceipts,
     notifications, saveNotifications, notifPrefs, saveNotifPrefs,
     garage, saveGarage, reminders, saveReminders,
-    rfqs, saveRfqs, vendors, saveVendors, purchaseOrders, savePurchaseOrders,
-    reviews, saveReviews,
+    rfqs, saveRfqs, vendors, saveVendors, purchaseOrders, savePurchaseOrders, grns, saveGrns,
+    reviews, saveReviews, staff, saveStaff,
     loaded, activeShopId, marketplacePage, setMarketplacePage,
     logAudit, resetAll
   } = useStore();
@@ -134,6 +138,45 @@ export default function App() {
         });
     }
 
+    const riData = localStorage.getItem("vl_recurring_invoices");
+    if (riData) {
+      try {
+        const recurringInvoices = JSON.parse(riData);
+        const RECURRENCE_DAYS = { monthly: 30, quarterly: 90, half_yearly: 182, yearly: 365 };
+        const now = Date.now();
+        let riUpdated = false;
+        const updatedRIs = recurringInvoices.map(ri => {
+          if (!ri.isActive || ri.shopId !== activeShopId) return ri;
+          if (ri.endDate && now > ri.endDate) return ri;
+          const intervalMs = (RECURRENCE_DAYS[ri.recurrence] || 30) * 86400000;
+          const nextDue = ri.lastGeneratedDate
+            ? ri.lastGeneratedDate + intervalMs
+            : ri.startDate || ri.createdAt;
+          if (now >= nextDue) {
+            const exists = newNotifs.find(n => n.type === 'RECURRING_DUE' && n.entityId === ri.id && !n.read);
+            if (!exists) {
+              const total = (ri.items || []).reduce((s, i) => s + i.rate * i.qty, 0);
+              newNotifs.unshift({
+                id: 'notif_' + uid(),
+                type: 'RECURRING_DUE',
+                title: 'Recurring Invoice Due',
+                body: `Recurring invoice for ${ri.customerName} (${fmt(total)}) is due for generation`,
+                icon: '🔄',
+                timestamp: now,
+                read: false,
+                entityId: ri.id
+              });
+              changed = true;
+            }
+          }
+          return ri;
+        });
+        if (riUpdated) {
+          localStorage.setItem("vl_recurring_invoices", JSON.stringify(updatedRIs));
+        }
+      } catch {}
+    }
+
     if (changed) {
       saveNotifications(newNotifs.slice(0, 50));
     }
@@ -187,12 +230,107 @@ export default function App() {
 
   const [showNotifPrefs, setShowNotifPrefs] = useState(false);
 
+  const [activeStaffId, setActiveStaffId] = useState(() => {
+    try { return localStorage.getItem("vl_active_staff_id") || null; } catch { return null; }
+  });
+  const [showStaffLogin, setShowStaffLogin] = useState(false);
+  const [staffPin, setStaffPin] = useState("");
+  const [staffLoginError, setStaffLoginError] = useState("");
+
+  const activeStaffMember = useMemo(() => {
+    if (!activeStaffId || !staff) return null;
+    return staff.find(s => s.id === activeStaffId) || null;
+  }, [activeStaffId, staff]);
+
+  const staffHasPermission = useCallback((perm) => {
+    if (!activeStaffMember) return true;
+    return activeStaffMember.permissions?.includes(perm) ?? false;
+  }, [activeStaffMember]);
+
+  const recordStaffSession = useCallback((staffMember, action, prevStaffId) => {
+    try {
+      const sessions = JSON.parse(localStorage.getItem("vl_staff_sessions") || "[]");
+      const now = Date.now();
+      let duration = "—";
+      if (action === "LOGOUT" && prevStaffId) {
+        const lastLogin = [...sessions].reverse().find(s => s.staffId === prevStaffId && s.action === "LOGIN");
+        if (lastLogin) {
+          const mins = Math.round((now - lastLogin.timestamp) / 60000);
+          duration = mins < 60 ? `${mins}m` : `${Math.floor(mins / 60)}h ${mins % 60}m`;
+        }
+      }
+      const entry = {
+        staffId: staffMember.id,
+        staffName: staffMember.name,
+        role: staffMember.role,
+        shopId: activeShopId,
+        action,
+        timestamp: now,
+        duration: action === "LOGOUT" ? duration : "—"
+      };
+      const updated = [entry, ...sessions].slice(0, 500);
+      localStorage.setItem("vl_staff_sessions", JSON.stringify(updated));
+    } catch {}
+  }, [activeShopId]);
+
+  const handleStaffLogin = useCallback(() => {
+    if (!staff || staffPin.length !== 4) {
+      setStaffLoginError("Enter a 4-digit PIN");
+      return;
+    }
+    const found = staff.find(s => s.pin === staffPin && s.shopId === activeShopId && s.isActive);
+    if (!found) {
+      setStaffLoginError("Invalid PIN or inactive staff");
+      return;
+    }
+    if (activeStaffMember) {
+      recordStaffSession(activeStaffMember, "LOGOUT", activeStaffMember.id);
+    }
+    setActiveStaffId(found.id);
+    localStorage.setItem("vl_active_staff_id", found.id);
+    recordStaffSession(found, "LOGIN");
+    const updatedStaff = staff.map(s => s.id === found.id ? { ...s, lastLoginAt: Date.now() } : s);
+    saveStaff(updatedStaff);
+    setStaffPin("");
+    setStaffLoginError("");
+    setShowStaffLogin(false);
+    toast(`Logged in as ${found.name} (${found.role})`, "success", "Staff Login");
+  }, [staff, staffPin, activeShopId, activeStaffMember, recordStaffSession, saveStaff, toast]);
+
+  const handleStaffLogout = useCallback(() => {
+    if (activeStaffMember) {
+      recordStaffSession(activeStaffMember, "LOGOUT", activeStaffMember.id);
+    }
+    setActiveStaffId(null);
+    localStorage.removeItem("vl_active_staff_id");
+    toast("Staff logged out", "info", "Logged Out");
+  }, [activeStaffMember, recordStaffSession, toast]);
+
+  const filteredNavItems = useMemo(() => {
+    if (!activeStaffMember) return NAV_ITEMS;
+    const role = activeStaffMember.role;
+    const perms = activeStaffMember.permissions || [];
+    if (role === "CASHIER") {
+      return NAV_ITEMS.filter(n => ["pos", "inventory", "staff"].includes(n.key));
+    }
+    if (role === "MANAGER") {
+      return NAV_ITEMS.filter(n => n.key !== "accounting");
+    }
+    if (role === "MECHANIC") {
+      return NAV_ITEMS.filter(n => ["dashboard", "inventory", "staff"].includes(n.key));
+    }
+    if (role === "WAREHOUSE") {
+      return NAV_ITEMS.filter(n => ["inventory", "purchase", "staff"].includes(n.key));
+    }
+    return NAV_ITEMS;
+  }, [activeStaffMember]);
+
   // APP MODE TOGGLE STATE
   const [appMode, setAppMode] = useState("marketplace");
   const [isAdminMode, setIsAdminMode] = useState(false);
   const [logoClicks, setLogoClicks] = useState(0);
   const [mpPdpId, setMpPdpId] = useState(null);
-  const [shopEdit, setShopEdit] = useState(null); // { name, city } or null
+  const [shopEdit, setShopEdit] = useState(null);
 
   const saveProduct = useCallback((p) => {
     const exists = products.find(x => x.id === p.id);
@@ -220,6 +358,8 @@ export default function App() {
       payment: paymentStr, paymentMode: data.paymentMode || null, creditDays: 0, paymentStatus: isCredit && !isQuote ? "pending" : "paid",
       note: [data.customerName && `Customer: ${data.customerName}`, data.vehicleReg && `Vehicle: ${data.vehicleReg}`, data.notes].filter(Boolean).join(" · ") || (isQuote ? "Quotation generated" : "Walk-in sale"),
       date: data.date,
+      staffId: activeStaffId || null,
+      staffName: activeStaffMember?.name || null,
       ...(data.priceOverride && { priceOverride: data.priceOverride }),
     }]);
 
@@ -251,12 +391,14 @@ export default function App() {
         total: item.total, gstAmount: item.gstAmount, profit: isQuote ? 0 : item.profit,
         discount: item.discount, customerName: data.customerName, customerPhone: data.customerPhone,
         vehicleReg: data.vehicleReg, mechanic: data.mechanic, supplier: null,
-        invoiceNo: data.invoiceNo, // Same invoice number for all line items!
+        invoiceNo: data.invoiceNo,
         payment: paymentStr, paymentMode: data.paymentMode || null, creditDays: 0,
         paymentStatus: isCredit && !isQuote ? "pending" : "paid",
         note: [data.customerName && `Customer: ${data.customerName}`, data.vehicleReg && `Vehicle: ${data.vehicleReg}`, data.notes].filter(Boolean).join(" · ") || (isQuote ? "Quotation" : "POS Sale"),
         date: data.date,
         multiItemInvoice: true,
+        staffId: data.staffId || activeStaffId || null,
+        staffName: data.staffName || activeStaffMember?.name || null,
         ...(item.priceOverride && { priceOverride: item.priceOverride }),
       });
 
@@ -495,13 +637,15 @@ export default function App() {
   const renderPage = () => {
     if (page === "dashboard") return <DashboardPage products={products} movements={movements} orders={orders} activeShopId={activeShopId} onNavigate={setPage} jobCards={jobCards} parties={parties} vehicles={vehicles} />;
     if (page === "inventory") return <InventoryPage products={products} movements={movements} activeShopId={activeShopId} onAdd={() => setPModal({ open: true, product: null })} onEdit={p => setPModal({ open: true, product: p })} onSale={handleSale} onPurchase={handlePurchase} onAdjust={handleAdjustment} toast={toast} />;
-    if (page === "pos") return <POSBillingPage products={products} activeShopId={activeShopId} onMultiSale={handleMultiItemSale} toast={toast} />;
+    if (page === "pos") return <POSBillingPage products={products} parties={parties} movements={movements} activeShopId={activeShopId} onMultiSale={handleMultiItemSale} toast={toast} activeStaffMember={activeStaffMember} onSwitchStaff={() => setShowStaffLogin(true)} onStaffLogout={handleStaffLogout} staffHasPermission={staffHasPermission} />;
     if (page === "history") return <HistoryPage movements={movements} activeShopId={activeShopId} />;
     if (page === "reports") return <ReportsPage movements={movements} products={products} activeShopId={activeShopId} receipts={receipts} saveReceipts={saveReceipts} onPaymentReceipt={handlePaymentReceipt} toast={toast} parties={parties} />;
-    if (page === "staff") return <StaffManagementPage movements={movements} activeShopId={activeShopId} toast={toast} />;
+    if (page === "staff") return <StaffManagementPage movements={movements} activeShopId={activeShopId} toast={toast} activeStaffMember={activeStaffMember} />;
     if (page === "orders") return <OrdersPage products={products} activeShopId={activeShopId} onSale={handleSale} toast={toast} orders={orders} saveOrders={saveOrders} movements={movements} saveMovements={saveMovements} />;
     if (page === "rfq") return <VendorRFQPage products={products} movements={movements} saveMovements={saveMovements} saveProducts={saveProducts} activeShopId={activeShopId} toast={toast} />;
-    if (page === "purchase") return <PurchaseEntryPage products={products} activeShopId={activeShopId} parties={parties} purchaseOrders={purchaseOrders} onMultiPurchase={handleMultiItemPurchase} toast={toast} />;
+    if (page === "purchase") return <PurchaseEntryPage products={products} movements={movements} activeShopId={activeShopId} parties={parties} purchaseOrders={purchaseOrders} grns={grns} saveGrns={saveGrns} savePurchaseOrders={savePurchaseOrders} saveProducts={saveProducts} saveMovements={saveMovements} onMultiPurchase={handleMultiItemPurchase} logAudit={logAudit} toast={toast} />;
+    if (page === "salesdocs") return <SalesDocumentsPage products={products} movements={movements} activeShopId={activeShopId} onMultiSale={handleMultiItemSale} saveProducts={saveProducts} saveMovements={saveMovements} toast={toast} parties={parties} />;
+    if (page === "masters") return <MastersPage toast={toast} />;
     if (page === "accounting") return <AccountingPage movements={movements} products={products} parties={parties} activeShopId={activeShopId} toast={toast} />;
     if (page === "settings") return <SettingsPage toast={toast} />;
     if (page === "parties") return <PartiesPage parties={parties} movements={movements} vehicles={vehicles} activeShopId={activeShopId} onSaveParty={(p) => { const exists = (parties || []).find(x => x.id === p.id); saveParties(exists ? parties.map(x => x.id === p.id ? p : x) : [...(parties || []), p]); logAudit(exists ? "PARTY_UPDATED" : "PARTY_CREATED", "party", p.id, p.name); }} onSaveVehicle={(v) => { const exists = (vehicles || []).find(x => x.id === v.id); saveVehicles(exists ? vehicles.map(x => x.id === v.id ? v : x) : [...(vehicles || []), v]); }} onPaymentReceipt={handlePaymentReceipt} toast={toast} />;
@@ -561,7 +705,7 @@ export default function App() {
 
         {/* NAV */}
         <div style={{ display: "flex", gap: 2 }}>
-          {NAV_ITEMS.map(n => (
+          {filteredNavItems.map(n => (
             <button key={n.key} className={`nav-item${page === n.key ? " nav-active" : ""}`} onClick={() => setPage(n.key)}
               style={{ background: page === n.key ? T.amberGlow : "transparent", color: page === n.key ? T.amber : T.t2, border: `1px solid ${page === n.key ? T.amber + "44" : "transparent"}`, borderRadius: 8, padding: "7px 14px", fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: FONT.ui, display: "flex", alignItems: "center", gap: 7, position: "relative" }}>
               <span style={{ fontSize: 15 }}>{n.icon}</span>{n.label}
@@ -573,6 +717,20 @@ export default function App() {
 
         <div style={{ flex: 1 }} />
 
+        {activeStaffMember ? (
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <div style={{ background: T.emeraldBg, border: `1px solid ${T.emerald}33`, borderRadius: 8, padding: "4px 10px", fontSize: 11, color: T.emerald, fontWeight: 700, display: "flex", alignItems: "center", gap: 6 }}>
+              🟢 {activeStaffMember.name} <span style={{ color: T.t3, fontWeight: 500 }}>({activeStaffMember.role})</span>
+            </div>
+            <button onClick={() => setShowStaffLogin(true)} style={{ background: T.surface, border: `1px solid ${T.border}`, borderRadius: 8, padding: "4px 10px", fontSize: 11, color: T.t3, cursor: "pointer", fontWeight: 600, fontFamily: FONT.ui }}>Switch</button>
+            <button onClick={handleStaffLogout} style={{ background: T.surface, border: `1px solid ${T.crimson}33`, borderRadius: 8, padding: "4px 10px", fontSize: 11, color: T.crimson, cursor: "pointer", fontWeight: 600, fontFamily: FONT.ui }}>Logout</button>
+          </div>
+        ) : (
+          <button onClick={() => setShowStaffLogin(true)} style={{ background: T.surface, border: `1px solid ${T.amber}44`, borderRadius: 8, padding: "5px 12px", fontSize: 12, color: T.amber, cursor: "pointer", fontWeight: 700, fontFamily: FONT.ui, display: "flex", alignItems: "center", gap: 6 }}>
+            👤 Staff Login
+          </button>
+        )}
+
         {/* NOTIFICATION BELL */}
         <NotificationBell
           notifications={notifications || []}
@@ -583,7 +741,7 @@ export default function App() {
         />
 
         {/* Quick stats */}
-        {todayRev > 0 && (
+        {todayRev > 0 && (!activeStaffMember || activeStaffMember.role !== "CASHIER") && (
           <div style={{ background: T.emeraldBg, border: `1px solid ${T.emerald}33`, borderRadius: 8, padding: "5px 12px", fontSize: 12, color: T.emerald, fontWeight: 700, fontFamily: FONT.mono, display: "flex", alignItems: "center", gap: 6 }}>
             📈 Today: {fmt(todayRev)}
           </div>
@@ -595,13 +753,13 @@ export default function App() {
         )}
 
         <Btn size="sm" variant="ghost" onClick={() => setPage("pos")} style={{ borderColor: T.border }}>🧾 POS</Btn>
-        <Btn size="sm" variant="amber" onClick={() => setPModal({ open: true, product: null })}>＋ Product</Btn>
+        {(!activeStaffMember || activeStaffMember.role !== "CASHIER") && <Btn size="sm" variant="amber" onClick={() => setPModal({ open: true, product: null })}>＋ Product</Btn>}
 
         {/* Reset button */}
         <button onClick={() => { if (confirm("Reset all data to defaults?")) resetAll(); }} style={{ background: "transparent", border: `1px solid ${T.border}`, borderRadius: 8, padding: "5px 10px", fontSize: 11, color: T.t3, cursor: "pointer", fontWeight: 600, fontFamily: FONT.ui }}>🔄</button>
 
         {/* Avatar */}
-        <div style={{ width: 34, height: 34, borderRadius: "50%", background: `linear-gradient(135deg,${T.amber},${T.amberDim})`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, color: "#000", fontWeight: 900, marginLeft: 4 }}>R</div>
+        <div style={{ width: 34, height: 34, borderRadius: "50%", background: `linear-gradient(135deg,${T.amber},${T.amberDim})`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, color: "#000", fontWeight: 900, marginLeft: 4 }}>{activeStaffMember ? activeStaffMember.name.charAt(0) : "R"}</div>
       </div>
 
       {/* PAGE CONTENT */}
@@ -611,6 +769,34 @@ export default function App() {
 
       {/* MODALS */}
       <ProductModal open={pModal.open} product={pModal.product} activeShopId={activeShopId} onClose={() => setPModal({ open: false, product: null })} onSave={saveProduct} toast={toast} />
+
+      {showStaffLogin && (
+        <div className="backdrop-in" style={{ position: "fixed", inset: 0, zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.5)", backdropFilter: "blur(4px)" }}>
+          <div className="modal-in" style={{ background: T.card, border: `1px solid ${T.borderHi}`, borderRadius: 16, width: 360, padding: 24, boxShadow: "0 20px 50px rgba(0,0,0,0.5)" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+              <h3 style={{ fontSize: 18, fontWeight: 800, color: T.t1 }}>👤 Staff Login</h3>
+              <button onClick={() => { setShowStaffLogin(false); setStaffPin(""); setStaffLoginError(""); }} style={{ background: "none", border: "none", color: T.t3, cursor: "pointer", fontSize: 20 }}>✕</button>
+            </div>
+            <div style={{ marginBottom: 16 }}>
+              <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: T.t2, marginBottom: 8 }}>Enter 4-Digit PIN</label>
+              <input
+                type="password" value={staffPin} autoFocus maxLength={4}
+                onChange={e => { setStaffPin(e.target.value.replace(/\D/g, '').slice(0, 4)); setStaffLoginError(""); }}
+                onKeyDown={e => { if (e.key === "Enter") handleStaffLogin(); }}
+                placeholder="••••"
+                style={{ width: "100%", padding: "14px 16px", background: T.surface, border: `1px solid ${staffLoginError ? T.crimson : T.border}`, borderRadius: 10, color: T.t1, fontSize: 24, fontFamily: FONT.mono, textAlign: "center", letterSpacing: "0.3em", outline: "none", boxSizing: "border-box" }}
+              />
+              {staffLoginError && <div style={{ color: T.crimson, fontSize: 12, fontWeight: 600, marginTop: 8 }}>{staffLoginError}</div>}
+            </div>
+            <Btn block variant="amber" onClick={handleStaffLogin}>Login</Btn>
+            {activeStaffMember && (
+              <div style={{ marginTop: 12, textAlign: "center", fontSize: 12, color: T.t3 }}>
+                Currently: <strong style={{ color: T.emerald }}>{activeStaffMember.name}</strong>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* NOTIFICATION PREFERENCES MODAL */}
       {showNotifPrefs && (

@@ -13,6 +13,7 @@ import {
   computeFinancialRatios,
   computeCostSheet,
   computeOutstandingAging,
+  computeCostCentrePnL,
 } from "../accounting";
 import { getNextVoucherNumber } from "../voucherNumbering";
 import {
@@ -31,6 +32,8 @@ const TABS = [
   { key: "cs", label: "Cost Sheet", icon: "🧮" },
   { key: "outstanding", label: "Outstanding", icon: "⏳" },
   { key: "ratios", label: "Ratios", icon: "📊" },
+  { key: "costcentres", label: "Cost Centres", icon: "🏢" },
+  { key: "yearend", label: "Year-End Close", icon: "🔒" },
 ];
 
 const VOUCHER_COLORS = {
@@ -103,6 +106,20 @@ export function AccountingPage({ movements, products, parties, activeShopId, toa
   const [addAccountOpen, setAddAccountOpen] = useState(false);
   const [newAcc, setNewAcc] = useState({ name: "", group: "ASSETS", subGroup: "Current Assets", type: "ASSET", normalBalance: "Dr" });
   const [expandedGroups, setExpandedGroups] = useState({ ASSETS: true, LIABILITIES: true, INCOME: true, EXPENSES: true, CAPITAL: true });
+  const [costCentres, setCostCentres] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("vl_cost_centres") || "[]"); } catch { return []; }
+  });
+  const [addCCOpen, setAddCCOpen] = useState(false);
+  const [newCC, setNewCC] = useState({ name: "", description: "" });
+  const [mjCostCentre, setMjCostCentre] = useState("");
+  const [lockedYears, setLockedYears] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("vl_locked_years") || "[]"); } catch { return []; }
+  });
+  const [yearEndConfirm, setYearEndConfirm] = useState(false);
+  const [selectedClosingYear, setSelectedClosingYear] = useState(() => {
+    const now = new Date();
+    return now.getMonth() >= 3 ? now.getFullYear() : now.getFullYear() - 1;
+  });
 
   const allAccounts = useMemo(() => [...CHART_OF_ACCOUNTS, ...customAccounts], [customAccounts]);
 
@@ -158,6 +175,7 @@ export function AccountingPage({ movements, products, parties, activeShopId, toa
       voucherType: isContra ? "Contra" : "Journal",
       voucherNo,
       narration: mjNarration,
+      costCentre: mjCostCentre || null,
       entries: validRows.map(r => {
         const acc = allAccounts.find(a => a.code === r.accountCode);
         return { accountCode: r.accountCode, accountName: acc?.name || r.accountCode, debit: parseFloat(r.debit) || 0, credit: parseFloat(r.credit) || 0 };
@@ -171,8 +189,9 @@ export function AccountingPage({ movements, products, parties, activeShopId, toa
     setMjRows([{ accountCode: "", debit: "", credit: "" }, { accountCode: "", debit: "", credit: "" }]);
     setMjNarration("");
     setMjType("Journal");
+    setMjCostCentre("");
     toast(`${isContra ? "Contra" : "Journal"} entry ${voucherNo} saved`, "success", `${isContra ? "Contra" : "Journal"} Created`);
-  }, [mjRows, mjNarration, mjDate, mjType, manualJournals, allAccounts, toast]);
+  }, [mjRows, mjNarration, mjDate, mjType, mjCostCentre, manualJournals, allAccounts, toast]);
 
   const saveContraVoucher = useCallback(() => {
     const amt = parseFloat(contraAmount);
@@ -408,6 +427,14 @@ export function AccountingPage({ movements, products, parties, activeShopId, toa
                 </select>
               </div>
               <div><label style={{ fontSize: 9, color: T.t3, fontWeight: 700, textTransform: "uppercase", display: "block", marginBottom: 4 }}>Narration</label><input value={mjNarration} onChange={e => setMjNarration(e.target.value)} placeholder="Description..." style={inputStyle} /></div>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 10, marginBottom: 12 }}>
+              <div><label style={{ fontSize: 9, color: T.t3, fontWeight: 700, textTransform: "uppercase", display: "block", marginBottom: 4 }}>Cost Centre (Optional)</label>
+                <select value={mjCostCentre} onChange={e => setMjCostCentre(e.target.value)} style={selectStyle}>
+                  <option value="">— No Cost Centre —</option>
+                  {costCentres.map(cc => <option key={cc.id} value={cc.id}>{cc.name}</option>)}
+                </select>
+              </div>
             </div>
             <div style={{ marginBottom: 8 }}>
               <TableRow header><span style={{ flex: 2 }}>Account</span><span style={{ width: 120, textAlign: "right" }}>Debit</span><span style={{ width: 120, textAlign: "right" }}>Credit</span><span style={{ width: 30 }}></span></TableRow>
@@ -1077,6 +1104,307 @@ export function AccountingPage({ movements, products, parties, activeShopId, toa
     );
   };
 
+  const saveCostCentre = useCallback(() => {
+    if (!newCC.name.trim()) { toast("Cost centre name required", "warning"); return; }
+    const cc = { id: "CC-" + uid(), name: newCC.name.trim(), description: newCC.description.trim(), createdAt: Date.now() };
+    const next = [...costCentres, cc];
+    setCostCentres(next);
+    localStorage.setItem("vl_cost_centres", JSON.stringify(next));
+    setAddCCOpen(false);
+    setNewCC({ name: "", description: "" });
+    toast(`Cost centre "${cc.name}" created`, "success");
+  }, [newCC, costCentres, toast]);
+
+  const deleteCostCentre = useCallback((ccId) => {
+    const next = costCentres.filter(cc => cc.id !== ccId);
+    setCostCentres(next);
+    localStorage.setItem("vl_cost_centres", JSON.stringify(next));
+    toast("Cost centre deleted", "info");
+  }, [costCentres, toast]);
+
+  const performYearEndClose = useCallback(() => {
+    const fyStart = new Date(selectedClosingYear, 3, 1).getTime();
+    const fyEnd = new Date(selectedClosingYear + 1, 2, 31, 23, 59, 59, 999).getTime();
+
+    if (lockedYears.includes(selectedClosingYear)) {
+      toast(`FY ${selectedClosingYear}-${String(selectedClosingYear + 1).slice(2)} is already closed`, "warning");
+      return;
+    }
+
+    const fyPnl = computeProfitAndLoss(journalEntries, fyStart, fyEnd);
+    const netProfit = fyPnl.netProfit;
+
+    const voucherNo = getNextVoucherNumber("JOURNAL", fyEnd);
+    const closingEntry = {
+      id: "YEC-" + uid(),
+      date: fyEnd,
+      voucherType: "Journal",
+      voucherNo,
+      narration: `Year-End Closing FY ${selectedClosingYear}-${String(selectedClosingYear + 1).slice(2)}: Transfer Net ${netProfit >= 0 ? "Profit" : "Loss"} of ${fmt(Math.abs(netProfit))} to Retained Earnings`,
+      costCentre: null,
+      entries: netProfit >= 0 ? [
+        ...fyPnl.revenue.items.map(r => ({ accountCode: r.code, accountName: r.name, debit: r.amount, credit: 0 })),
+        ...fyPnl.expenses.items.map(e => ({ accountCode: e.code, accountName: e.name, debit: 0, credit: e.amount })),
+        { accountCode: "AC051", accountName: "Retained Earnings", debit: 0, credit: netProfit },
+      ] : [
+        ...fyPnl.revenue.items.map(r => ({ accountCode: r.code, accountName: r.name, debit: r.amount, credit: 0 })),
+        { accountCode: "AC051", accountName: "Retained Earnings", debit: Math.abs(netProfit), credit: 0 },
+        ...fyPnl.expenses.items.map(e => ({ accountCode: e.code, accountName: e.name, debit: 0, credit: e.amount })),
+      ],
+      refId: null,
+      refType: "YEAR_END_CLOSE",
+    };
+
+    const nextJournals = [...manualJournals, closingEntry];
+    setManualJournals(nextJournals);
+    localStorage.setItem("vl_manual_journals", JSON.stringify(nextJournals));
+
+    const nextLocked = [...lockedYears, selectedClosingYear];
+    setLockedYears(nextLocked);
+    localStorage.setItem("vl_locked_years", JSON.stringify(nextLocked));
+
+    setYearEndConfirm(false);
+    toast(`Year-end closing completed for FY ${selectedClosingYear}-${String(selectedClosingYear + 1).slice(2)}. Net ${netProfit >= 0 ? "Profit" : "Loss"}: ${fmt(Math.abs(netProfit))} transferred to Retained Earnings.`, "success", "Year-End Close");
+  }, [selectedClosingYear, lockedYears, journalEntries, manualJournals, toast]);
+
+  const renderCostCentres = () => {
+    const ccPnl = computeCostCentrePnL(journalEntries, costCentres, startTs, endTs);
+
+    return (
+      <div>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <div style={{ fontSize: 14, fontWeight: 700, color: T.t2 }}>Manage cost centres for expense/revenue allocation</div>
+          <Btn size="sm" variant="amber" onClick={() => setAddCCOpen(true)}>＋ Add Cost Centre</Btn>
+        </div>
+
+        {addCCOpen && (
+          <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 12, padding: 16, marginBottom: 16 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 12 }}>New Cost Centre</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 2fr", gap: 10, marginBottom: 12 }}>
+              <div>
+                <label style={{ fontSize: 9, color: T.t3, fontWeight: 700, textTransform: "uppercase", display: "block", marginBottom: 4 }}>Name</label>
+                <input value={newCC.name} onChange={e => setNewCC(p => ({ ...p, name: e.target.value }))} placeholder="e.g. Workshop, Sales Counter" style={inputStyle} />
+              </div>
+              <div>
+                <label style={{ fontSize: 9, color: T.t3, fontWeight: 700, textTransform: "uppercase", display: "block", marginBottom: 4 }}>Description</label>
+                <input value={newCC.description} onChange={e => setNewCC(p => ({ ...p, description: e.target.value }))} placeholder="Optional description" style={inputStyle} />
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <Btn size="sm" variant="ghost" onClick={() => setAddCCOpen(false)}>Cancel</Btn>
+              <Btn size="sm" variant="amber" onClick={saveCostCentre}>Save</Btn>
+            </div>
+          </div>
+        )}
+
+        {costCentres.length === 0 ? (
+          <EmptyState icon="🏢" title="No Cost Centres" subtitle="Create cost centres like Workshop, Sales Counter, Branch A to track department-wise profitability" />
+        ) : (
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 24 }}>
+            {costCentres.map(cc => {
+              const ccData = ccPnl.find(p => p.id === cc.id);
+              return (
+                <div key={cc.id} style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 12, padding: 16, borderLeft: `3px solid #A78BFA` }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 8 }}>
+                    <div>
+                      <div style={{ fontSize: 14, fontWeight: 800, color: T.t1 }}>{cc.name}</div>
+                      {cc.description && <div style={{ fontSize: 11, color: T.t3, marginTop: 2 }}>{cc.description}</div>}
+                    </div>
+                    <button onClick={() => deleteCostCentre(cc.id)} style={{ background: "none", border: "none", color: T.crimson, cursor: "pointer", fontSize: 12, fontFamily: FONT.ui }}>✕ Delete</button>
+                  </div>
+                  {ccData ? (
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginTop: 8 }}>
+                      <div style={{ textAlign: "center", padding: 8, background: T.surface, borderRadius: 8 }}>
+                        <div style={{ fontSize: 9, color: T.t3, fontWeight: 700, textTransform: "uppercase" }}>Revenue</div>
+                        <div style={{ ...mono, fontSize: 14, fontWeight: 700, color: T.emerald }}>{fmt(ccData.totalRevenue)}</div>
+                      </div>
+                      <div style={{ textAlign: "center", padding: 8, background: T.surface, borderRadius: 8 }}>
+                        <div style={{ fontSize: 9, color: T.t3, fontWeight: 700, textTransform: "uppercase" }}>Expenses</div>
+                        <div style={{ ...mono, fontSize: 14, fontWeight: 700, color: T.crimson }}>{fmt(ccData.totalExpenses)}</div>
+                      </div>
+                      <div style={{ textAlign: "center", padding: 8, background: T.surface, borderRadius: 8 }}>
+                        <div style={{ fontSize: 9, color: T.t3, fontWeight: 700, textTransform: "uppercase" }}>Net P/L</div>
+                        <div style={{ ...mono, fontSize: 14, fontWeight: 700, color: ccData.netProfit >= 0 ? T.emerald : T.crimson }}>{ccData.netProfit >= 0 ? fmt(ccData.netProfit) : "(" + fmt(Math.abs(ccData.netProfit)) + ")"}</div>
+                      </div>
+                    </div>
+                  ) : (
+                    <div style={{ fontSize: 11, color: T.t4, marginTop: 8 }}>No entries allocated to this cost centre yet</div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {ccPnl.length > 0 && (
+          <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 12, padding: 16 }}>
+            <SectionHeader title="COST CENTRE-WISE P&L COMPARISON" color="#A78BFA" />
+            <ResponsiveContainer width="100%" height={280}>
+              <BarChart data={ccPnl.map(cc => ({ name: cc.name.slice(0, 15), Revenue: cc.totalRevenue, Expenses: cc.totalExpenses, Profit: cc.netProfit }))} margin={{ top: 10, right: 20, bottom: 10, left: 20 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke={T.border} />
+                <XAxis dataKey="name" tick={{ fill: T.t3, fontSize: 11 }} />
+                <YAxis tick={{ fill: T.t3, fontSize: 10 }} />
+                <Tooltip contentStyle={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 8, fontFamily: FONT.mono }} formatter={(v) => fmt(v)} />
+                <Legend wrapperStyle={{ fontSize: 11 }} />
+                <Bar dataKey="Revenue" fill={T.emerald} radius={[4, 4, 0, 0]} />
+                <Bar dataKey="Expenses" fill={T.crimson} radius={[4, 4, 0, 0]} />
+                <Bar dataKey="Profit" fill={T.amber} radius={[4, 4, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const renderYearEnd = () => {
+    const fyStart = new Date(selectedClosingYear, 3, 1).getTime();
+    const fyEnd = new Date(selectedClosingYear + 1, 2, 31, 23, 59, 59, 999).getTime();
+    const fyPnl = computeProfitAndLoss(journalEntries, fyStart, fyEnd);
+    const fyBs = computeBalanceSheet(journalEntries, fyEnd);
+    const isLocked = lockedYears.includes(selectedClosingYear);
+    const currentFY = new Date().getMonth() >= 3 ? new Date().getFullYear() : new Date().getFullYear() - 1;
+    const yearOptions = [];
+    for (let y = currentFY; y >= currentFY - 5; y--) yearOptions.push(y);
+
+    return (
+      <div>
+        <div style={{ display: "flex", gap: 12, marginBottom: 20, alignItems: "flex-end" }}>
+          <div>
+            <label style={{ fontSize: 9, color: T.t3, fontWeight: 700, textTransform: "uppercase", display: "block", marginBottom: 4 }}>Select Financial Year</label>
+            <select value={selectedClosingYear} onChange={e => setSelectedClosingYear(Number(e.target.value))} style={selectStyle}>
+              {yearOptions.map(y => <option key={y} value={y}>FY {y}-{String(y + 1).slice(2)} {lockedYears.includes(y) ? "🔒 (Closed)" : ""}</option>)}
+            </select>
+          </div>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 20 }}>
+          <div style={{ background: T.emeraldBg, border: `1px solid ${T.emerald}33`, borderRadius: 12, padding: "14px 16px" }}>
+            <div style={{ fontSize: 10, color: T.emerald, fontWeight: 700, textTransform: "uppercase" }}>FY Revenue</div>
+            <div style={{ ...mono, fontSize: 20, fontWeight: 800, color: T.emerald, marginTop: 4 }}>{fmt(fyPnl.revenue.total)}</div>
+          </div>
+          <div style={{ background: T.crimsonBg, border: `1px solid ${T.crimson}33`, borderRadius: 12, padding: "14px 16px" }}>
+            <div style={{ fontSize: 10, color: T.crimson, fontWeight: 700, textTransform: "uppercase" }}>FY Expenses</div>
+            <div style={{ ...mono, fontSize: 20, fontWeight: 800, color: T.crimson, marginTop: 4 }}>{fmt(fyPnl.expenses.total)}</div>
+          </div>
+          <div style={{ background: fyPnl.netProfit >= 0 ? T.amberGlow : T.crimsonBg, border: `1px solid ${fyPnl.netProfit >= 0 ? T.amber : T.crimson}33`, borderRadius: 12, padding: "14px 16px" }}>
+            <div style={{ fontSize: 10, color: fyPnl.netProfit >= 0 ? T.amber : T.crimson, fontWeight: 700, textTransform: "uppercase" }}>Net {fyPnl.netProfit >= 0 ? "Profit" : "Loss"}</div>
+            <div style={{ ...mono, fontSize: 20, fontWeight: 800, color: fyPnl.netProfit >= 0 ? T.amber : T.crimson, marginTop: 4 }}>{fmt(Math.abs(fyPnl.netProfit))}</div>
+          </div>
+        </div>
+
+        {isLocked && (
+          <div style={{ background: `${T.emerald}11`, border: `1px solid ${T.emerald}33`, borderRadius: 12, padding: 16, marginBottom: 20, display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={{ fontSize: 24 }}>🔒</span>
+            <div>
+              <div style={{ fontSize: 14, fontWeight: 800, color: T.emerald }}>Year Closed</div>
+              <div style={{ fontSize: 12, color: T.t3 }}>FY {selectedClosingYear}-{String(selectedClosingYear + 1).slice(2)} has been closed. P&L has been transferred to Retained Earnings. Past-year vouchers cannot be edited without override.</div>
+            </div>
+          </div>
+        )}
+
+        <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 12, padding: 16, marginBottom: 20 }}>
+          <SectionHeader title="YEAR-END P&L SUMMARY" />
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+            <div>
+              <div style={{ fontSize: 12, fontWeight: 700, color: T.emerald, marginBottom: 8 }}>Income</div>
+              {fyPnl.revenue.items.length === 0 ? <div style={{ fontSize: 12, color: T.t4 }}>No income</div> : fyPnl.revenue.items.map(item => (
+                <div key={item.code} style={{ display: "flex", justifyContent: "space-between", padding: "4px 0", borderBottom: `1px solid ${T.border}22` }}>
+                  <span style={{ fontSize: 12 }}>{item.name}</span>
+                  <span style={{ ...mono, fontSize: 12, color: T.emerald }}>{fmt(item.amount)}</span>
+                </div>
+              ))}
+              <div style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", fontWeight: 800, marginTop: 4 }}>
+                <span style={{ fontSize: 12 }}>Total</span>
+                <span style={{ ...mono, fontSize: 13, color: T.emerald }}>{fmt(fyPnl.revenue.total)}</span>
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: 12, fontWeight: 700, color: T.crimson, marginBottom: 8 }}>Expenses</div>
+              {fyPnl.expenses.items.length === 0 ? <div style={{ fontSize: 12, color: T.t4 }}>No expenses</div> : fyPnl.expenses.items.map(item => (
+                <div key={item.code} style={{ display: "flex", justifyContent: "space-between", padding: "4px 0", borderBottom: `1px solid ${T.border}22` }}>
+                  <span style={{ fontSize: 12 }}>{item.name}</span>
+                  <span style={{ ...mono, fontSize: 12, color: T.crimson }}>{fmt(item.amount)}</span>
+                </div>
+              ))}
+              <div style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", fontWeight: 800, marginTop: 4 }}>
+                <span style={{ fontSize: 12 }}>Total</span>
+                <span style={{ ...mono, fontSize: 13, color: T.crimson }}>{fmt(fyPnl.expenses.total)}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 12, padding: 16, marginBottom: 20 }}>
+          <SectionHeader title="BALANCE SHEET CARRY-FORWARD PREVIEW" color={T.sky} />
+          <div style={{ fontSize: 12, color: T.t3, marginBottom: 12 }}>Opening balances for the next financial year (Balance Sheet accounts only — Assets, Liabilities, Capital)</div>
+          <div style={{ borderRadius: 10, overflow: "hidden", border: `1px solid ${T.border}` }}>
+            <TableRow header>
+              <span style={{ width: 70 }}>Code</span>
+              <span style={{ flex: 1 }}>Account</span>
+              <span style={{ width: 100 }}>Group</span>
+              <span style={{ width: 120, textAlign: "right" }}>Closing Balance</span>
+            </TableRow>
+            {[...fyBs.assets.currentAssets, ...fyBs.assets.fixedAssets].filter(a => a.amount !== 0).map((a, i) => (
+              <TableRow key={a.code} even={i % 2 === 0}>
+                <span style={{ width: 70, ...mono, fontSize: 11, color: T.t3 }}>{a.code}</span>
+                <span style={{ flex: 1, fontSize: 12 }}>{a.name}</span>
+                <span style={{ width: 100, fontSize: 10, color: T.t3 }}>Assets</span>
+                <span style={{ width: 120, textAlign: "right", ...mono, fontSize: 12, color: drColor, fontWeight: 600 }}>{fmt(a.amount)} Dr</span>
+              </TableRow>
+            ))}
+            {[...fyBs.liabilities.currentLiabilities, ...fyBs.liabilities.longTermLiabilities].filter(a => a.amount !== 0).map((a, i) => (
+              <TableRow key={a.code} even={i % 2 === 0}>
+                <span style={{ width: 70, ...mono, fontSize: 11, color: T.t3 }}>{a.code}</span>
+                <span style={{ flex: 1, fontSize: 12 }}>{a.name}</span>
+                <span style={{ width: 100, fontSize: 10, color: T.t3 }}>Liabilities</span>
+                <span style={{ width: 120, textAlign: "right", ...mono, fontSize: 12, color: crColor, fontWeight: 600 }}>{fmt(a.amount)} Cr</span>
+              </TableRow>
+            ))}
+            {fyBs.capital.items.filter(a => a.amount !== 0).map((a, i) => (
+              <TableRow key={a.code} even={i % 2 === 0}>
+                <span style={{ width: 70, ...mono, fontSize: 11, color: T.t3 }}>{a.code}</span>
+                <span style={{ flex: 1, fontSize: 12 }}>{a.name}</span>
+                <span style={{ width: 100, fontSize: 10, color: T.t3 }}>Capital</span>
+                <span style={{ width: 120, textAlign: "right", ...mono, fontSize: 12, color: crColor, fontWeight: 600 }}>{fmt(a.amount)} Cr</span>
+              </TableRow>
+            ))}
+          </div>
+        </div>
+
+        {lockedYears.length > 0 && (
+          <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 12, padding: 16, marginBottom: 20 }}>
+            <SectionHeader title="CLOSED YEARS" color={T.emerald} />
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {lockedYears.sort().map(y => (
+                <span key={y} style={{ padding: "6px 14px", borderRadius: 8, background: `${T.emerald}18`, color: T.emerald, fontSize: 12, fontWeight: 700 }}>🔒 FY {y}-{String(y + 1).slice(2)}</span>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {!isLocked && (
+          <div style={{ background: `linear-gradient(135deg, ${T.card}, ${T.surface})`, border: `1px solid ${T.borderHi}`, borderRadius: 14, padding: 24, textAlign: "center" }}>
+            <div style={{ fontSize: 28, marginBottom: 8 }}>🔒</div>
+            <div style={{ fontSize: 16, fontWeight: 800, color: T.t1, marginBottom: 4 }}>Close Financial Year</div>
+            <div style={{ fontSize: 12, color: T.t3, marginBottom: 16, maxWidth: 500, margin: "0 auto 16px" }}>
+              This will calculate the net {fyPnl.netProfit >= 0 ? "profit" : "loss"} of <strong style={{ color: fyPnl.netProfit >= 0 ? T.amber : T.crimson }}>{fmt(Math.abs(fyPnl.netProfit))}</strong> and create a journal entry transferring it to Retained Earnings. The year will be locked — no editing past-year vouchers without override.
+            </div>
+            {!yearEndConfirm ? (
+              <Btn variant="amber" onClick={() => setYearEndConfirm(true)}>Close FY {selectedClosingYear}-{String(selectedClosingYear + 1).slice(2)}</Btn>
+            ) : (
+              <div style={{ display: "flex", gap: 12, justifyContent: "center", alignItems: "center" }}>
+                <span style={{ fontSize: 13, color: T.crimson, fontWeight: 700 }}>Are you sure? This action cannot be undone.</span>
+                <Btn variant="ghost" size="sm" onClick={() => setYearEndConfirm(false)}>Cancel</Btn>
+                <Btn variant="amber" size="sm" onClick={performYearEndClose}>Confirm & Close Year</Btn>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  };
+
   const renderTab = () => {
     switch (tab) {
       case "coa": return renderCOA();
@@ -1089,6 +1417,8 @@ export function AccountingPage({ movements, products, parties, activeShopId, toa
       case "cs": return renderCostSheet();
       case "outstanding": return renderOutstanding();
       case "ratios": return renderRatios();
+      case "costcentres": return renderCostCentres();
+      case "yearend": return renderYearEnd();
       default: return null;
     }
   };

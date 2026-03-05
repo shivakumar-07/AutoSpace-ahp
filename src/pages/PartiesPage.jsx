@@ -15,6 +15,12 @@ export function PartiesPage({ parties, movements, vehicles, activeShopId, onSave
     const [receiptNotes, setReceiptNotes] = useState("");
     const [allocMode, setAllocMode] = useState("fifo");
     const [billAllocations, setBillAllocations] = useState({});
+    const [statementParty, setStatementParty] = useState(null);
+    const [stmtFromDate, setStmtFromDate] = useState(() => {
+        const d = new Date(); d.setMonth(d.getMonth() - 3);
+        return d.toISOString().split("T")[0];
+    });
+    const [stmtToDate, setStmtToDate] = useState(() => new Date().toISOString().split("T")[0]);
 
     const shopParties = useMemo(() => (parties || []).filter(p => p.shopId === activeShopId), [parties, activeShopId]);
     const shopVehicles = useMemo(() => (vehicles || []).filter(v => v.shopId === activeShopId), [vehicles, activeShopId]);
@@ -86,8 +92,8 @@ export function PartiesPage({ parties, movements, vehicles, activeShopId, onSave
     };
 
     const handleExportCSV = () => {
-        const headers = ["Name", "Type", "Phone", "GSTIN", "City", "Credit Limit", "Outstanding", "Transactions", "Tags"];
-        const rows = filtered.map(p => [p.name, p.type, p.phone, p.gstin || "", p.city || "", p.creditLimit, getBalance(p), getTransactionCount(p), (p.tags || []).join(", ")]);
+        const headers = ["Name", "Type", "Phone", "GSTIN", "PAN", "GST Type", "Place of Supply", "City", "Credit Limit", "Payment Terms", "Outstanding", "Transactions", "TDS Applicable", "Tags"];
+        const rows = filtered.map(p => [p.name, p.type, p.phone, p.gstin || "", p.pan || "", p.gstType || "", p.placeOfSupply || "", p.city || "", p.creditLimit, p.paymentTerms || "", getBalance(p), getTransactionCount(p), p.tdsApplicable ? "Yes" : "No", (p.tags || []).join(", ")]);
         downloadCSV(`${view}_${fmtDate(Date.now()).replace(/\s/g, "_")}.csv`, generateCSV(headers, rows));
         toast?.("Party list exported!", "success");
     };
@@ -290,7 +296,7 @@ export function PartiesPage({ parties, movements, vehicles, activeShopId, onSave
                         <table style={{ width: "100%", borderCollapse: "collapse" }}>
                             <thead>
                                 <tr style={{ background: T.surface, borderBottom: `1px solid ${T.border}` }}>
-                                    {["Name", "Phone", "GSTIN", "City", "Credit Limit", "Outstanding", "Aging", "Txns", "Actions"].map((h, i) => (
+                                    {["Name", "Phone", "GSTIN / PAN", "City", "Credit Limit", "Outstanding", "Aging", "Txns", "Actions"].map((h, i) => (
                                         <th key={i} style={{ padding: "10px 14px", textAlign: "left", color: T.t3, fontWeight: 600, fontSize: 10, textTransform: "uppercase", fontFamily: FONT.ui }}>{h}</th>
                                     ))}
                                 </tr>
@@ -320,7 +326,11 @@ export function PartiesPage({ parties, movements, vehicles, activeShopId, onSave
                                                     </div>
                                                 </td>
                                                 <td style={{ padding: "12px 14px", fontFamily: FONT.mono, fontSize: 12, color: T.t2 }}>{p.phone}</td>
-                                                <td style={{ padding: "12px 14px", fontFamily: FONT.mono, fontSize: 11, color: p.gstin ? T.t2 : T.t4 }}>{p.gstin || "—"}</td>
+                                                <td style={{ padding: "12px 14px" }}>
+                                                    <div style={{ fontFamily: FONT.mono, fontSize: 11, color: p.gstin ? T.t2 : T.t4 }}>{p.gstin || "—"}</div>
+                                                    {p.pan && <div style={{ fontFamily: FONT.mono, fontSize: 10, color: T.t3, marginTop: 2 }}>PAN: {p.pan}</div>}
+                                                    {p.gstType && p.gstType !== "Unregistered" && <div style={{ fontSize: 9, color: T.sky, fontWeight: 700, marginTop: 2 }}>{p.gstType}</div>}
+                                                </td>
                                                 <td style={{ padding: "12px 14px", fontSize: 12, color: T.t2 }}>{p.city || "—"}</td>
                                                 <td style={{ padding: "12px 14px", fontFamily: FONT.mono, fontSize: 12, color: T.t2 }}>{fmt(p.creditLimit)}</td>
                                                 <td style={{ padding: "12px 14px", fontFamily: FONT.mono, fontSize: 14, fontWeight: 800, color: bal > 0 ? T.crimson : T.emerald }}>{bal > 0 ? fmt(bal) : "—"}</td>
@@ -372,8 +382,9 @@ export function PartiesPage({ parties, movements, vehicles, activeShopId, onSave
                                                 </td>
                                                 <td style={{ padding: "12px 14px", fontFamily: FONT.mono, fontSize: 12, color: T.t2 }}>{txns}</td>
                                                 <td style={{ padding: "12px 14px" }}>
-                                                    <div style={{ display: "flex", gap: 5 }} onClick={e => e.stopPropagation()}>
+                                                    <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }} onClick={e => e.stopPropagation()}>
                                                         <Btn size="xs" variant="subtle" onClick={() => { setEditParty(p); setShowAddModal(true); }}>Edit</Btn>
+                                                        <Btn size="xs" variant="sky" onClick={() => setStatementParty(p)}>📄 Statement</Btn>
                                                         {bal > 0 && (view === "customers" || view === "suppliers") && (
                                                             <Btn size="xs" variant="emerald" onClick={() => handleOpenReceiptModal(p)}>💰</Btn>
                                                         )}
@@ -572,36 +583,301 @@ export function PartiesPage({ parties, movements, vehicles, activeShopId, onSave
                     );
                 })()}
             </Modal>
+
+            <Modal open={!!statementParty} onClose={() => setStatementParty(null)} title={`Customer Statement — ${statementParty?.name || ""}`} width={800}>
+                {statementParty && (() => {
+                    const fromTs = new Date(stmtFromDate).getTime();
+                    const toTs = new Date(stmtToDate).getTime() + 86400000;
+                    const partyTxns = shopMovements
+                        .filter(m => {
+                            const isMatch = m.customerName === statementParty.name || m.supplierName === statementParty.name || m.supplier === statementParty.name;
+                            return isMatch && m.date >= fromTs && m.date < toTs;
+                        })
+                        .sort((a, b) => a.date - b.date);
+
+                    const openingBal = (() => {
+                        let bal = statementParty.openingBalance || 0;
+                        shopMovements
+                            .filter(m => {
+                                const isMatch = m.customerName === statementParty.name || m.supplierName === statementParty.name || m.supplier === statementParty.name;
+                                return isMatch && m.date < fromTs;
+                            })
+                            .forEach(m => {
+                                if (m.type === "SALE" || m.type === "PURCHASE") bal += (m.total || 0);
+                                if (m.type === "RECEIPT" || m.type === "PAYMENT") bal -= (m.total || 0);
+                            });
+                        return bal;
+                    })();
+
+                    let runBal = openingBal;
+                    const rows = partyTxns.map(m => {
+                        const debit = (m.type === "SALE" || m.type === "PURCHASE") ? m.total : 0;
+                        const credit = (m.type === "RECEIPT" || m.type === "PAYMENT") ? m.total : 0;
+                        runBal += debit - credit;
+                        return { ...m, debit, credit, balance: runBal };
+                    });
+                    const closingBal = runBal;
+
+                    const stmtText = [
+                        `Statement of Account — ${statementParty.name}`,
+                        `Period: ${fmtDate(fromTs)} to ${fmtDate(toTs - 86400000)}`,
+                        `Opening Balance: ${fmt(openingBal)}`,
+                        "",
+                        ...rows.map(r => `${fmtDate(r.date)} | ${r.type} | ${r.invoiceNo || r.id?.slice(0, 8) || ""} | Dr: ${fmt(r.debit)} | Cr: ${fmt(r.credit)} | Bal: ${fmt(r.balance)}`),
+                        "",
+                        `Closing Balance: ${fmt(closingBal)}`,
+                    ].join("\n");
+
+                    const handlePrint = () => {
+                        const w = window.open("", "_blank");
+                        w.document.write(`<html><head><title>Statement — ${statementParty.name}</title><style>body{font-family:sans-serif;padding:24px;color:#222}table{width:100%;border-collapse:collapse;margin-top:16px}th,td{border:1px solid #ddd;padding:8px 12px;text-align:right;font-size:13px}th{background:#f5f5f5;text-align:left;font-size:11px;text-transform:uppercase}td:first-child,th:first-child{text-align:left}.dr{color:#c00}.cr{color:#070}h2{margin:0}p{margin:4px 0;color:#666;font-size:13px}</style></head><body>`);
+                        w.document.write(`<h2>Statement of Account</h2>`);
+                        w.document.write(`<p><strong>${statementParty.name}</strong>${statementParty.phone ? ` · ${statementParty.phone}` : ""}${statementParty.gstin ? ` · GSTIN: ${statementParty.gstin}` : ""}</p>`);
+                        w.document.write(`<p>Period: ${fmtDate(fromTs)} to ${fmtDate(toTs - 86400000)}</p>`);
+                        w.document.write(`<p>Opening Balance: <strong>${fmt(openingBal)}</strong></p>`);
+                        w.document.write(`<table><thead><tr><th>Date</th><th>Type</th><th>Reference</th><th>Description</th><th>Debit</th><th>Credit</th><th>Balance</th></tr></thead><tbody>`);
+                        rows.forEach(r => {
+                            w.document.write(`<tr><td>${fmtDate(r.date)}</td><td>${r.type}</td><td>${r.invoiceNo || r.id?.slice(0, 8) || ""}</td><td>${r.productName || r.note || ""}</td><td class="dr">${r.debit > 0 ? fmt(r.debit) : ""}</td><td class="cr">${r.credit > 0 ? fmt(r.credit) : ""}</td><td>${fmt(r.balance)}</td></tr>`);
+                        });
+                        w.document.write(`</tbody></table>`);
+                        w.document.write(`<p style="margin-top:16px;font-size:16px"><strong>Closing Balance: ${fmt(closingBal)}</strong></p>`);
+                        w.document.write(`</body></html>`);
+                        w.document.close();
+                        w.print();
+                    };
+
+                    const handleWhatsApp = () => {
+                        const phone = (statementParty.phone || "").replace(/\D/g, "");
+                        const cleanPhone = phone.startsWith("91") ? phone : "91" + phone;
+                        const msg = encodeURIComponent(stmtText);
+                        window.open(`https://wa.me/${cleanPhone}?text=${msg}`, "_blank");
+                    };
+
+                    return (
+                        <>
+                            <div style={{ display: "flex", gap: 12, marginBottom: 16, alignItems: "flex-end" }}>
+                                <div style={{ flex: 1 }}>
+                                    <label style={{ fontSize: 10, color: T.t3, fontWeight: 700, textTransform: "uppercase", display: "block", marginBottom: 4 }}>From</label>
+                                    <input type="date" value={stmtFromDate} onChange={e => setStmtFromDate(e.target.value)}
+                                        style={{ width: "100%", padding: "8px 12px", background: T.surface, border: `1px solid ${T.border}`, borderRadius: 8, color: T.t1, fontSize: 13, fontFamily: FONT.ui, outline: "none", boxSizing: "border-box" }} />
+                                </div>
+                                <div style={{ flex: 1 }}>
+                                    <label style={{ fontSize: 10, color: T.t3, fontWeight: 700, textTransform: "uppercase", display: "block", marginBottom: 4 }}>To</label>
+                                    <input type="date" value={stmtToDate} onChange={e => setStmtToDate(e.target.value)}
+                                        style={{ width: "100%", padding: "8px 12px", background: T.surface, border: `1px solid ${T.border}`, borderRadius: 8, color: T.t1, fontSize: 13, fontFamily: FONT.ui, outline: "none", boxSizing: "border-box" }} />
+                                </div>
+                                <Btn size="sm" variant="subtle" onClick={handlePrint}>🖨 Print</Btn>
+                                {statementParty.phone && <Btn size="sm" onClick={handleWhatsApp} style={{ background: "#25D366", color: "#fff", borderColor: "#25D366" }}>💬 WhatsApp</Btn>}
+                            </div>
+
+                            <div style={{ background: T.surface, border: `1px solid ${T.border}`, borderRadius: 10, padding: 14, marginBottom: 12 }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                                    <div>
+                                        <div style={{ fontSize: 16, fontWeight: 800, color: T.t1 }}>{statementParty.name}</div>
+                                        <div style={{ fontSize: 12, color: T.t3, marginTop: 2 }}>
+                                            {statementParty.phone && <span>{statementParty.phone} · </span>}
+                                            {statementParty.gstin && <span>GSTIN: {statementParty.gstin} · </span>}
+                                            {statementParty.city && <span>{statementParty.city}</span>}
+                                        </div>
+                                    </div>
+                                    <div style={{ textAlign: "right" }}>
+                                        <div style={{ fontSize: 10, color: T.t3, fontWeight: 600, textTransform: "uppercase" }}>Opening Balance</div>
+                                        <div style={{ fontSize: 18, fontWeight: 900, fontFamily: FONT.mono, color: openingBal > 0 ? T.crimson : T.emerald }}>{fmt(openingBal)}</div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div style={{ maxHeight: 400, overflowY: "auto", borderRadius: 10, border: `1px solid ${T.border}` }}>
+                                <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                                    <thead>
+                                        <tr style={{ background: T.surface, borderBottom: `1px solid ${T.border}` }}>
+                                            {["Date", "Type", "Reference", "Description", "Debit", "Credit", "Balance"].map(h => (
+                                                <th key={h} style={{ padding: "8px 12px", textAlign: "left", color: T.t3, fontWeight: 600, fontSize: 10, textTransform: "uppercase", fontFamily: FONT.ui, position: "sticky", top: 0, background: T.surface }}>{h}</th>
+                                            ))}
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {rows.length === 0 ? (
+                                            <tr><td colSpan={7} style={{ padding: 32, textAlign: "center", color: T.t3 }}>No transactions in this period.</td></tr>
+                                        ) : rows.map((r, i) => (
+                                            <tr key={i} style={{ borderBottom: `1px solid ${T.border}` }} className="row-hover">
+                                                <td style={{ padding: "8px 12px", fontSize: 12, color: T.t2 }}>{fmtDate(r.date)}</td>
+                                                <td style={{ padding: "8px 12px" }}>
+                                                    <span style={{
+                                                        fontSize: 10, fontWeight: 700, padding: "2px 8px", borderRadius: 10,
+                                                        background: r.type === "SALE" || r.type === "PURCHASE" ? `${T.amber}18` : `${T.emerald}18`,
+                                                        color: r.type === "SALE" || r.type === "PURCHASE" ? T.amber : T.emerald,
+                                                    }}>{r.type}</span>
+                                                </td>
+                                                <td style={{ padding: "8px 12px", fontSize: 12, fontFamily: FONT.mono, color: T.t2 }}>{r.invoiceNo || r.id?.slice(0, 8) || "—"}</td>
+                                                <td style={{ padding: "8px 12px", fontSize: 12, color: T.t2, maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.productName || r.note || "—"}</td>
+                                                <td style={{ padding: "8px 12px", fontSize: 12, fontFamily: FONT.mono, fontWeight: 700, color: r.debit > 0 ? T.crimson : T.t4, textAlign: "right" }}>{r.debit > 0 ? fmt(r.debit) : "—"}</td>
+                                                <td style={{ padding: "8px 12px", fontSize: 12, fontFamily: FONT.mono, fontWeight: 700, color: r.credit > 0 ? T.emerald : T.t4, textAlign: "right" }}>{r.credit > 0 ? fmt(r.credit) : "—"}</td>
+                                                <td style={{ padding: "8px 12px", fontSize: 12, fontFamily: FONT.mono, fontWeight: 800, color: r.balance > 0 ? T.crimson : T.emerald, textAlign: "right" }}>{fmt(r.balance)}</td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+
+                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 12, padding: "12px 16px", background: T.surface, borderRadius: 10, border: `1px solid ${T.border}` }}>
+                                <div style={{ display: "flex", gap: 20 }}>
+                                    <div>
+                                        <div style={{ fontSize: 10, color: T.t3, fontWeight: 600, textTransform: "uppercase" }}>Total Debit</div>
+                                        <div style={{ fontSize: 16, fontWeight: 900, fontFamily: FONT.mono, color: T.crimson }}>{fmt(rows.reduce((s, r) => s + r.debit, 0))}</div>
+                                    </div>
+                                    <div>
+                                        <div style={{ fontSize: 10, color: T.t3, fontWeight: 600, textTransform: "uppercase" }}>Total Credit</div>
+                                        <div style={{ fontSize: 16, fontWeight: 900, fontFamily: FONT.mono, color: T.emerald }}>{fmt(rows.reduce((s, r) => s + r.credit, 0))}</div>
+                                    </div>
+                                </div>
+                                <div style={{ textAlign: "right" }}>
+                                    <div style={{ fontSize: 10, color: T.t3, fontWeight: 600, textTransform: "uppercase" }}>Closing Balance</div>
+                                    <div style={{ fontSize: 22, fontWeight: 900, fontFamily: FONT.mono, color: closingBal > 0 ? T.crimson : T.emerald }}>{fmt(closingBal)}</div>
+                                </div>
+                            </div>
+                        </>
+                    );
+                })()}
+            </Modal>
         </div>
     );
 }
 
+const GSTIN_REGEX = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/;
+const PAN_REGEX = /^[A-Z]{5}[0-9]{4}[A-Z]{1}$/;
+
+const INDIAN_STATES = [
+    { code: "01", name: "Jammu & Kashmir" }, { code: "02", name: "Himachal Pradesh" }, { code: "03", name: "Punjab" },
+    { code: "04", name: "Chandigarh" }, { code: "05", name: "Uttarakhand" }, { code: "06", name: "Haryana" },
+    { code: "07", name: "Delhi" }, { code: "08", name: "Rajasthan" }, { code: "09", name: "Uttar Pradesh" },
+    { code: "10", name: "Bihar" }, { code: "11", name: "Sikkim" }, { code: "12", name: "Arunachal Pradesh" },
+    { code: "13", name: "Nagaland" }, { code: "14", name: "Manipur" }, { code: "15", name: "Mizoram" },
+    { code: "16", name: "Tripura" }, { code: "17", name: "Meghalaya" }, { code: "18", name: "Assam" },
+    { code: "19", name: "West Bengal" }, { code: "20", name: "Jharkhand" }, { code: "21", name: "Odisha" },
+    { code: "22", name: "Chhattisgarh" }, { code: "23", name: "Madhya Pradesh" }, { code: "24", name: "Gujarat" },
+    { code: "26", name: "Dadra & Nagar Haveli and Daman & Diu" }, { code: "27", name: "Maharashtra" },
+    { code: "28", name: "Andhra Pradesh (Old)" }, { code: "29", name: "Karnataka" }, { code: "30", name: "Goa" },
+    { code: "31", name: "Lakshadweep" }, { code: "32", name: "Kerala" }, { code: "33", name: "Tamil Nadu" },
+    { code: "34", name: "Puducherry" }, { code: "35", name: "Andaman & Nicobar" }, { code: "36", name: "Telangana" },
+    { code: "37", name: "Andhra Pradesh" }, { code: "38", name: "Ladakh" },
+];
+
+const GST_TYPES = [
+    { value: "Regular", label: "Regular" },
+    { value: "Composition", label: "Composition" },
+    { value: "Unregistered", label: "Unregistered" },
+    { value: "Consumer", label: "Consumer" },
+];
+
+const PAYMENT_TERMS = [
+    { value: "Due on Receipt", label: "Due on Receipt" },
+    { value: "Net 15", label: "Net 15" },
+    { value: "Net 30", label: "Net 30" },
+    { value: "Net 45", label: "Net 45" },
+    { value: "Net 60", label: "Net 60" },
+];
+
 function PartyFormModal({ open, party, type, onClose, onSave, activeShopId }) {
     const isEdit = !!party;
-    const blank = { name: "", phone: "", email: "", gstin: "", address: "", city: "", creditLimit: "0", creditDays: "30", loyaltyPoints: "0", openingBalance: "0", tags: "", notes: "" };
+    const blank = {
+        name: "", phone: "", email: "", gstin: "", pan: "", address: "", city: "",
+        placeOfSupply: "", gstType: "Unregistered", tdsApplicable: false,
+        creditLimit: "0", creditDays: "30", loyaltyPoints: "0",
+        openingBalance: "0", openingBalanceType: "Receivable",
+        paymentTerms: "Due on Receipt",
+        tags: "", notes: "",
+    };
     const [f, setF] = useState(blank);
+    const [gstinError, setGstinError] = useState("");
+    const [panError, setPanError] = useState("");
 
     useEffect(() => {
         if (party) {
-            setF({ ...party, creditLimit: String(party.creditLimit || 0), creditDays: String(party.creditDays || 30), loyaltyPoints: String(party.loyaltyPoints || 0), openingBalance: String(party.openingBalance || 0), tags: (party.tags || []).join(", ") });
+            setF({
+                ...party,
+                pan: party.pan || "",
+                placeOfSupply: party.placeOfSupply || "",
+                gstType: party.gstType || "Unregistered",
+                tdsApplicable: party.tdsApplicable || false,
+                openingBalanceType: party.openingBalanceType || (type === "customer" ? "Receivable" : "Payable"),
+                paymentTerms: party.paymentTerms || "Due on Receipt",
+                creditLimit: String(party.creditLimit || 0),
+                creditDays: String(party.creditDays || 30),
+                loyaltyPoints: String(party.loyaltyPoints || 0),
+                openingBalance: String(party.openingBalance || 0),
+                tags: (party.tags || []).join(", "),
+            });
         } else {
-            setF(blank);
+            setF({ ...blank, openingBalanceType: type === "customer" ? "Receivable" : "Payable" });
         }
+        setGstinError("");
+        setPanError("");
     }, [party, open]);
 
     const set = k => v => setF(p => ({ ...p, [k]: v }));
 
+    const validateGstin = (val) => {
+        if (!val) { setGstinError(""); return true; }
+        const upper = val.toUpperCase();
+        if (!GSTIN_REGEX.test(upper)) {
+            setGstinError("Invalid GSTIN format (expected: 22AAAAA0000A1Z5)");
+            return false;
+        }
+        setGstinError("");
+        return true;
+    };
+
+    const validatePan = (val) => {
+        if (!val) { setPanError(""); return true; }
+        const upper = val.toUpperCase();
+        if (!PAN_REGEX.test(upper)) {
+            setPanError("Invalid PAN format (expected: ABCDE1234F)");
+            return false;
+        }
+        setPanError("");
+        return true;
+    };
+
+    const handleGstinChange = (val) => {
+        const upper = val.toUpperCase();
+        set("gstin")(upper);
+        validateGstin(upper);
+        if (upper.length >= 4 && !f.pan) {
+            const extractedPan = upper.substring(2, 12);
+            if (PAN_REGEX.test(extractedPan)) {
+                set("pan")(extractedPan);
+            }
+        }
+        if (upper.length >= 2) {
+            const stateCode = upper.substring(0, 2);
+            const state = INDIAN_STATES.find(s => s.code === stateCode);
+            if (state && !f.placeOfSupply) {
+                set("placeOfSupply")(stateCode);
+            }
+        }
+    };
+
     const handleSave = () => {
         if (!f.name.trim()) return;
+        if (f.gstin && !validateGstin(f.gstin)) return;
+        if (f.pan && !validatePan(f.pan)) return;
         onSave({
             ...f,
             id: party?.id || (type === "customer" ? "cust" : "sup") + "_" + uid(),
             shopId: party?.shopId || activeShopId,
             type: party?.type || type,
+            gstin: (f.gstin || "").toUpperCase(),
+            pan: (f.pan || "").toUpperCase(),
+            placeOfSupply: f.placeOfSupply || "",
+            gstType: f.gstType || "Unregistered",
+            tdsApplicable: !!f.tdsApplicable,
             creditLimit: +f.creditLimit || 0,
             creditDays: +f.creditDays || 30,
             loyaltyPoints: +f.loyaltyPoints || 0,
             openingBalance: +f.openingBalance || 0,
+            openingBalanceType: f.openingBalanceType || (type === "customer" ? "Receivable" : "Payable"),
+            paymentTerms: f.paymentTerms || "Due on Receipt",
             tags: f.tags ? f.tags.split(",").map(t => t.trim()).filter(Boolean) : [],
             vehicles: party?.vehicles || [],
             isActive: true,
@@ -610,20 +886,65 @@ function PartyFormModal({ open, party, type, onClose, onSave, activeShopId }) {
     };
 
     return (
-        <Modal open={open} onClose={onClose} title={isEdit ? `Edit ${type === "customer" ? "Customer" : "Supplier"}` : `Add ${type === "customer" ? "Customer" : "Supplier"}`} width={560}>
+        <Modal open={open} onClose={onClose} title={isEdit ? `Edit ${type === "customer" ? "Customer" : "Supplier"}` : `Add ${type === "customer" ? "Customer" : "Supplier"}`} width={620}>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
                 <div style={{ gridColumn: "span 2" }}><Field label="Name" required><Input value={f.name} onChange={set("name")} placeholder="Business or person name" /></Field></div>
                 <Field label="Phone"><Input value={f.phone} onChange={set("phone")} placeholder="+91 9876543210" /></Field>
                 <Field label="Email"><Input value={f.email} onChange={set("email")} placeholder="email@example.com" /></Field>
-                <Field label="GSTIN"><Input value={f.gstin} onChange={set("gstin")} placeholder="22AAAAA0000A1Z5" /></Field>
                 <Field label="City"><Input value={f.city} onChange={set("city")} placeholder="Hyderabad" /></Field>
                 <div style={{ gridColumn: "span 2" }}><Field label="Address"><Input value={f.address} onChange={set("address")} placeholder="Full address" /></Field></div>
+
+                <Divider label="GST & Tax Details" />
+                <div style={{ gridColumn: "span 2" }} />
+
+                <Field label="GSTIN">
+                    <Input value={f.gstin} onChange={handleGstinChange} placeholder="22AAAAA0000A1Z5" />
+                    {gstinError && <div style={{ fontSize: 10, color: T.crimson, marginTop: 4, fontWeight: 600 }}>{gstinError}</div>}
+                </Field>
+                <Field label="PAN">
+                    <Input value={f.pan} onChange={(v) => { const upper = v.toUpperCase(); set("pan")(upper); validatePan(upper); }} placeholder="ABCDE1234F" />
+                    {panError && <div style={{ fontSize: 10, color: T.crimson, marginTop: 4, fontWeight: 600 }}>{panError}</div>}
+                </Field>
+                <Field label="Place of Supply (State)">
+                    <Select value={f.placeOfSupply} onChange={set("placeOfSupply")} options={[
+                        { value: "", label: "-- Select State --" },
+                        ...INDIAN_STATES.map(s => ({ value: s.code, label: `${s.code} - ${s.name}` })),
+                    ]} />
+                </Field>
+                <Field label="GST Registration Type">
+                    <Select value={f.gstType} onChange={set("gstType")} options={GST_TYPES} />
+                </Field>
+                <Field label="TDS Applicable">
+                    <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 4 }}>
+                        <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: 13, color: T.t1 }}>
+                            <input type="checkbox" checked={!!f.tdsApplicable} onChange={e => set("tdsApplicable")(e.target.checked)} style={{ accentColor: T.amber, width: 16, height: 16, cursor: "pointer" }} />
+                            Yes, TDS is applicable
+                        </label>
+                    </div>
+                </Field>
+
                 <Divider label="Credit & Finance" />
                 <div style={{ gridColumn: "span 2" }} />
                 <Field label="Credit Limit (₹)"><Input type="number" value={f.creditLimit} onChange={set("creditLimit")} prefix="₹" /></Field>
-                <Field label="Credit Days"><Input type="number" value={f.creditDays} onChange={set("creditDays")} suffix="days" /></Field>
+                <Field label="Payment Terms">
+                    <Select value={f.paymentTerms} onChange={(v) => {
+                        set("paymentTerms")(v);
+                        if (v === "Due on Receipt") set("creditDays")("0");
+                        else if (v === "Net 15") set("creditDays")("15");
+                        else if (v === "Net 30") set("creditDays")("30");
+                        else if (v === "Net 45") set("creditDays")("45");
+                        else if (v === "Net 60") set("creditDays")("60");
+                    }} options={PAYMENT_TERMS} />
+                </Field>
                 <Field label="Opening Balance (₹)"><Input type="number" value={f.openingBalance} onChange={set("openingBalance")} prefix="₹" /></Field>
+                <Field label="Balance Type">
+                    <Select value={f.openingBalanceType} onChange={set("openingBalanceType")} options={[
+                        { value: "Receivable", label: "Receivable (They owe us)" },
+                        { value: "Payable", label: "Payable (We owe them)" },
+                    ]} />
+                </Field>
                 {type === "customer" && <Field label="Loyalty Points"><Input type="number" value={f.loyaltyPoints} onChange={set("loyaltyPoints")} /></Field>}
+                <Field label="Credit Days"><Input type="number" value={f.creditDays} onChange={set("creditDays")} suffix="days" /></Field>
                 <div style={{ gridColumn: "span 2" }}><Field label="Tags (comma-separated)"><Input value={f.tags} onChange={set("tags")} placeholder="regular, mechanic, credit" /></Field></div>
                 <div style={{ gridColumn: "span 2" }}><Field label="Notes"><Input value={f.notes} onChange={set("notes")} placeholder="Internal notes" /></Field></div>
             </div>

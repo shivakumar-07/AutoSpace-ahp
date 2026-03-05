@@ -2,7 +2,7 @@ import React, { useState, useMemo, useCallback } from "react";
 import { T, FONT } from "../theme";
 import { useStore } from "../store";
 import { Badge, Btn, Input, Select, StatCard, Divider, EmptyState } from "../components/ui";
-import { fmt, daysAgo, uid, fmtDate } from "../utils";
+import { fmt, daysAgo, uid, fmtDate, fmtDateTime, fmtTime } from "../utils";
 
 const ROLE_CONFIG = {
     MANAGER: { color: T.violet, label: "Manager" },
@@ -32,7 +32,7 @@ const ROLE_DEFAULTS = {
     WAREHOUSE: ["can_receive_stock", "can_adjust_stock", "can_view_stock"],
 };
 
-export default function StaffManagementPage({ movements, activeShopId, toast }) {
+export default function StaffManagementPage({ movements, activeShopId, toast, activeStaffMember }) {
     const { staff, saveStaff } = useStore();
     const [activeTab, setActiveTab] = useState("list");
     const [editingStaff, setEditingStaff] = useState(null);
@@ -49,7 +49,12 @@ export default function StaffManagementPage({ movements, activeShopId, toast }) 
 
     const shopStaff = useMemo(() => staff?.filter(s => s.shopId === activeShopId) || [], [staff, activeShopId]);
 
-    // Stats
+    const sessions = useMemo(() => {
+        try { return JSON.parse(localStorage.getItem("vl_staff_sessions") || "[]"); } catch { return []; }
+    }, [activeTab]);
+
+    const shopSessions = useMemo(() => sessions.filter(s => s.shopId === activeShopId), [sessions, activeShopId]);
+
     const totalStaff = shopStaff.length;
     const activeStaffCount = shopStaff.filter(s => s.isActive).length;
     const totalSalesToday = useMemo(() => {
@@ -58,6 +63,30 @@ export default function StaffManagementPage({ movements, activeShopId, toast }) 
             .filter(m => m.shopId === activeShopId && m.type === "SALE" && m.date >= today)
             .reduce((sum, m) => sum + m.total, 0);
     }, [movements, activeShopId]);
+
+    const staffPerformance = useMemo(() => {
+        const perfMap = {};
+        shopStaff.forEach(s => {
+            perfMap[s.id] = { name: s.name, role: s.role, salesCount: 0, totalRevenue: 0, totalProfit: 0, avgTicket: 0, todaySales: 0, todayRevenue: 0 };
+        });
+        const today = new Date().setHours(0, 0, 0, 0);
+        movements.filter(m => m.shopId === activeShopId && m.type === "SALE").forEach(m => {
+            const sid = m.staffId;
+            if (sid && perfMap[sid]) {
+                perfMap[sid].salesCount++;
+                perfMap[sid].totalRevenue += m.total || 0;
+                perfMap[sid].totalProfit += m.profit || 0;
+                if (m.date >= today) {
+                    perfMap[sid].todaySales++;
+                    perfMap[sid].todayRevenue += m.total || 0;
+                }
+            }
+        });
+        Object.values(perfMap).forEach(p => {
+            p.avgTicket = p.salesCount > 0 ? p.totalRevenue / p.salesCount : 0;
+        });
+        return Object.entries(perfMap).map(([id, data]) => ({ id, ...data })).sort((a, b) => b.totalRevenue - a.totalRevenue);
+    }, [movements, shopStaff, activeShopId]);
 
     const handleEdit = (s) => {
         setEditingStaff(s);
@@ -134,12 +163,20 @@ export default function StaffManagementPage({ movements, activeShopId, toast }) 
         toast("Status updated", "info");
     };
 
+    const TABS = ["list", "edit", "performance", "sessions", "roles"];
+
     return (
         <div className="page-in" style={{ padding: "24px 32px", maxWidth: 1200, margin: "0 auto" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24 }}>
                 <div>
                     <h1 style={{ fontSize: 28, fontWeight: 800, color: T.t1, marginBottom: 4 }}>Staff Management</h1>
                     <p style={{ color: T.t3 }}>Manage team members, roles and permissions</p>
+                    {activeStaffMember && (
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+                            <span style={{ fontSize: 11, color: T.t3 }}>Logged in as:</span>
+                            <Badge color={ROLE_CONFIG[activeStaffMember.role]?.color || T.amber}>{activeStaffMember.name} ({ROLE_CONFIG[activeStaffMember.role]?.label})</Badge>
+                        </div>
+                    )}
                 </div>
                 {activeTab === "list" && (
                     <Btn onClick={() => { resetForm(); setActiveTab("edit"); }} icon="＋" intent="primary">Add New Staff</Btn>
@@ -152,17 +189,17 @@ export default function StaffManagementPage({ movements, activeShopId, toast }) 
                 <div style={{ flex: 1 }}><StatCard label="Today's Staff Sales" value={fmt(totalSalesToday)} icon="💰" color={T.amber} /></div>
             </div>
 
-            <div style={{ display: "flex", gap: 8, borderBottom: `1px solid ${T.border}`, marginBottom: 24 }}>
-                {["list", "edit", "roles"].map(t => (
+            <div style={{ display: "flex", gap: 8, borderBottom: `1px solid ${T.border}`, marginBottom: 24, overflowX: "auto" }}>
+                {TABS.map(t => (
                     <button key={t} onClick={() => setActiveTab(t)}
                         style={{
                             padding: "12px 20px", background: "none", border: "none", cursor: "pointer",
                             color: activeTab === t ? T.amber : T.t3,
                             borderBottom: `2px solid ${activeTab === t ? T.amber : "transparent"}`,
                             fontWeight: 600, fontSize: 14, textTransform: "uppercase", letterSpacing: "0.05em",
-                            transition: "all 0.2s"
+                            transition: "all 0.2s", whiteSpace: "nowrap"
                         }}>
-                        {t === "list" ? "Staff List" : t === "edit" ? (editingStaff ? "Edit Staff" : "Add Staff") : "Role Permissions"}
+                        {t === "list" ? "Staff List" : t === "edit" ? (editingStaff ? "Edit Staff" : "Add Staff") : t === "performance" ? "Performance" : t === "sessions" ? "Login Sessions" : "Role Permissions"}
                     </button>
                 ))}
             </div>
@@ -299,6 +336,103 @@ export default function StaffManagementPage({ movements, activeShopId, toast }) 
                 </div>
             )}
 
+            {activeTab === "performance" && (
+                <div style={{ background: T.surface, borderRadius: 20, border: `1px solid ${T.border}`, overflow: "hidden" }}>
+                    <div style={{ padding: "20px 24px", borderBottom: `1px solid ${T.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                        <div>
+                            <div style={{ fontSize: 18, fontWeight: 800, color: T.t1 }}>📊 Per-User Sales Performance</div>
+                            <div style={{ fontSize: 12, color: T.t3, marginTop: 2 }}>Sales attributed to each staff member</div>
+                        </div>
+                    </div>
+                    {staffPerformance.length === 0 ? (
+                        <div style={{ padding: 40, textAlign: "center" }}><EmptyState icon="📊" title="No staff performance data" /></div>
+                    ) : (
+                        <table style={{ width: "100%", borderCollapse: "collapse", textAlign: "left" }}>
+                            <thead>
+                                <tr style={{ background: T.bg + "88" }}>
+                                    {["#", "Staff Member", "Role", "Total Sales", "Revenue", "Profit", "Avg Ticket", "Today Sales", "Today Revenue"].map(h => (
+                                        <th key={h} style={{ padding: "14px 16px", color: T.t3, fontWeight: 700, fontSize: 11, textTransform: "uppercase", letterSpacing: "0.06em" }}>{h}</th>
+                                    ))}
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {staffPerformance.map((p, idx) => (
+                                    <tr key={p.id} style={{ borderBottom: `1px solid ${T.border}` }}>
+                                        <td style={{ padding: "14px 16px", fontFamily: FONT.mono, fontSize: 12, color: T.t4, fontWeight: 700 }}>{idx + 1}</td>
+                                        <td style={{ padding: "14px 16px" }}>
+                                            <div style={{ fontWeight: 700, color: T.t1, fontSize: 14 }}>{p.name}</div>
+                                        </td>
+                                        <td style={{ padding: "14px 16px" }}>
+                                            <Badge color={ROLE_CONFIG[p.role]?.color || T.t3}>{ROLE_CONFIG[p.role]?.label || p.role}</Badge>
+                                        </td>
+                                        <td style={{ padding: "14px 16px", fontFamily: FONT.mono, fontWeight: 700, fontSize: 14, color: T.t1 }}>{p.salesCount}</td>
+                                        <td style={{ padding: "14px 16px", fontFamily: FONT.mono, fontWeight: 700, fontSize: 14, color: T.sky }}>{fmt(p.totalRevenue)}</td>
+                                        <td style={{ padding: "14px 16px", fontFamily: FONT.mono, fontWeight: 700, fontSize: 14, color: p.totalProfit >= 0 ? T.emerald : T.crimson }}>{fmt(p.totalProfit)}</td>
+                                        <td style={{ padding: "14px 16px", fontFamily: FONT.mono, fontWeight: 600, fontSize: 13, color: T.t2 }}>{fmt(p.avgTicket)}</td>
+                                        <td style={{ padding: "14px 16px", fontFamily: FONT.mono, fontWeight: 700, fontSize: 14, color: T.amber }}>{p.todaySales}</td>
+                                        <td style={{ padding: "14px 16px", fontFamily: FONT.mono, fontWeight: 700, fontSize: 14, color: T.amber }}>{fmt(p.todayRevenue)}</td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    )}
+                    <div style={{ padding: 20, background: T.bg + "44" }}>
+                        <div style={{ display: "flex", gap: 16, alignItems: "center", padding: 16, background: T.skyBg, borderRadius: 12, border: `1px solid ${T.sky}33` }}>
+                            <div style={{ fontSize: 24 }}>ℹ️</div>
+                            <div style={{ fontSize: 13, color: T.t2, lineHeight: 1.5 }}>
+                                Sales are automatically attributed to the logged-in staff member. Use the "Switch Staff" button on the POS page to change the active operator. Performance data updates in real-time.
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {activeTab === "sessions" && (
+                <div style={{ background: T.surface, borderRadius: 20, border: `1px solid ${T.border}`, overflow: "hidden" }}>
+                    <div style={{ padding: "20px 24px", borderBottom: `1px solid ${T.border}` }}>
+                        <div style={{ fontSize: 18, fontWeight: 800, color: T.t1 }}>🕐 Login / Logout Sessions</div>
+                        <div style={{ fontSize: 12, color: T.t3, marginTop: 2 }}>Track when staff members clock in and out</div>
+                    </div>
+                    {shopSessions.length === 0 ? (
+                        <div style={{ padding: 40, textAlign: "center" }}><EmptyState icon="🕐" title="No session history yet" subtitle="Sessions are recorded when staff log in via the POS page" /></div>
+                    ) : (
+                        <div style={{ maxHeight: 500, overflowY: "auto" }}>
+                            <table style={{ width: "100%", borderCollapse: "collapse", textAlign: "left" }}>
+                                <thead>
+                                    <tr style={{ background: T.bg + "88", position: "sticky", top: 0, zIndex: 1 }}>
+                                        {["Staff", "Role", "Action", "Date & Time", "Duration"].map(h => (
+                                            <th key={h} style={{ padding: "14px 16px", color: T.t3, fontWeight: 700, fontSize: 11, textTransform: "uppercase", letterSpacing: "0.06em" }}>{h}</th>
+                                        ))}
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {shopSessions.sort((a, b) => b.timestamp - a.timestamp).slice(0, 100).map((sess, idx) => (
+                                        <tr key={idx} style={{ borderBottom: `1px solid ${T.border}` }}>
+                                            <td style={{ padding: "12px 16px", fontWeight: 600, color: T.t1, fontSize: 13 }}>{sess.staffName}</td>
+                                            <td style={{ padding: "12px 16px" }}>
+                                                <Badge color={ROLE_CONFIG[sess.role]?.color || T.t3}>{ROLE_CONFIG[sess.role]?.label || sess.role}</Badge>
+                                            </td>
+                                            <td style={{ padding: "12px 16px" }}>
+                                                <span style={{
+                                                    display: "inline-flex", alignItems: "center", gap: 4,
+                                                    padding: "3px 10px", borderRadius: 6, fontSize: 11, fontWeight: 700,
+                                                    background: sess.action === "LOGIN" ? T.emeraldBg : T.crimsonBg,
+                                                    color: sess.action === "LOGIN" ? T.emerald : T.crimson
+                                                }}>
+                                                    {sess.action === "LOGIN" ? "🟢 Login" : "🔴 Logout"}
+                                                </span>
+                                            </td>
+                                            <td style={{ padding: "12px 16px", fontFamily: FONT.mono, fontSize: 12, color: T.t2 }}>{fmtDateTime(sess.timestamp)}</td>
+                                            <td style={{ padding: "12px 16px", fontFamily: FONT.mono, fontSize: 12, color: T.t3 }}>{sess.duration || "—"}</td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    )}
+                </div>
+            )}
+
             {activeTab === "roles" && (
                 <div style={{ background: T.surface, borderRadius: 20, border: `1px solid ${T.border}`, overflow: "hidden" }}>
                     <table style={{ width: "100%", borderCollapse: "collapse", textAlign: "left" }}>
@@ -335,6 +469,9 @@ export default function StaffManagementPage({ movements, activeShopId, toast }) 
                                 <div style={{ fontSize: 14, color: T.t2, lineHeight: 1.5 }}>
                                     Each staff member has a unique 4-digit PIN. On the POS Billing page, the "Switch Staff" button allows team members to authenticate. 
                                     Sales are automatically linked to the logged-in staff for performance tracking. Individual permissions can be further customized in the "Edit Staff" tab.
+                                    <br/><br/>
+                                    <strong>Cashier Mode:</strong> Hides P&L, margins, cost prices, reports — shows only POS and limited inventory.<br/>
+                                    <strong>Manager Mode:</strong> Full access except owner financials (capital, equity, owner drawings).
                                 </div>
                             </div>
                         </div>
