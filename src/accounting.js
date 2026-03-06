@@ -377,6 +377,76 @@ export function generateJournalEntries(movements, products, parties, activeShopI
         break;
       }
 
+      case "REVERSAL": {
+        // Reversal creates an opposite entry to the original
+        const revTotal = Math.abs(total);
+        const revGst = Math.abs(gst);
+        const revBase = revTotal - revGst;
+
+        // Determine original type and reverse accordingly
+        const origType = m.originalType || "";
+        let revRows = [];
+
+        if (origType === "SALE" || m.originalMovementId?.startsWith?.("SALE")) {
+          revRows = [
+            { accountCode: "AC020", accountName: "Sales Revenue", debit: revBase > 0 ? revBase : revTotal, credit: 0 },
+          ];
+          if (revGst > 0) revRows.push({ accountCode: "AC011", accountName: "GST Output Tax", debit: revGst, credit: 0 });
+          const payAccCode = resolvePaymentAccount(m.paymentMode || m.payment);
+          revRows.push({ accountCode: payAccCode, accountName: getAccountName(payAccCode), debit: 0, credit: revTotal });
+        } else if (origType === "PURCHASE") {
+          const payAccCode = resolvePaymentAccountForPurchase(m.paymentMode || m.payment);
+          revRows = [
+            { accountCode: payAccCode, accountName: getAccountName(payAccCode), debit: revTotal, credit: 0 },
+            { accountCode: "AC004", accountName: "Inventory", debit: 0, credit: revBase > 0 ? revBase : revTotal },
+          ];
+          if (revGst > 0) revRows.push({ accountCode: "AC005", accountName: "GST Input Credit", debit: 0, credit: revGst });
+        } else {
+          // Generic reversal — reverse the debit/credit
+          revRows = [
+            { accountCode: "AC040", accountName: "Miscellaneous Expenses", debit: revTotal, credit: 0 },
+            { accountCode: "AC001", accountName: "Cash in Hand", debit: 0, credit: revTotal },
+          ];
+        }
+
+        entries.push({
+          id: "JE-" + m.id,
+          date: m.date,
+          voucherType: "Reversal",
+          voucherNo: m.invoiceNo || "REV-" + m.id,
+          narration: m.note || `Reversal of ${m.originalInvoiceNo || m.originalMovementId || "document"}`,
+          entries: revRows,
+          refId: m.id,
+          refType: "REVERSAL",
+        });
+        break;
+      }
+
+      case "JOURNAL": {
+        // Manual journal entry — entries are pre-defined in the movement
+        const journalRows = (m.journalEntries || []).map(je => ({
+          accountCode: je.accountCode,
+          accountName: je.accountName || getAccountName(je.accountCode),
+          debit: je.debit || 0,
+          credit: je.credit || 0,
+        }));
+
+        if (journalRows.length > 0) {
+          entries.push({
+            id: "JE-" + m.id,
+            date: m.date,
+            voucherType: "Journal",
+            voucherNo: m.invoiceNo || "JNL-" + m.id,
+            narration: m.note || "Manual Journal Entry",
+            entries: journalRows,
+            refId: m.id,
+            refType: "JOURNAL",
+            costCentre: m.costCentre || null,
+          });
+        }
+        break;
+      }
+
       default:
         break;
     }
@@ -942,5 +1012,275 @@ export function computeOutstandingAging(movements, parties, activeShopId) {
     totalPayable,
     receivableAging,
     payableAging,
+  };
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// EXPANDED GST-READY CHART OF ACCOUNTS (numeric 1000–5400 series)
+// Maps old AC0xx codes to new numeric codes for reference. Both work.
+// ════════════════════════════════════════════════════════════════════════
+export const EXPANDED_COA = [
+  // 1000 – ASSETS
+  { code: "1000", name: "Cash in Hand", group: "ASSETS", subGroup: "Current Assets", type: "ASSET", normalBalance: "Dr", legacyCode: "AC001" },
+  { code: "1010", name: "Petty Cash", group: "ASSETS", subGroup: "Current Assets", type: "ASSET", normalBalance: "Dr" },
+  { code: "1100", name: "Bank Account – Primary", group: "ASSETS", subGroup: "Current Assets", type: "ASSET", normalBalance: "Dr", legacyCode: "AC002" },
+  { code: "1110", name: "Bank Account – Secondary", group: "ASSETS", subGroup: "Current Assets", type: "ASSET", normalBalance: "Dr" },
+  { code: "1200", name: "Accounts Receivable", group: "ASSETS", subGroup: "Current Assets", type: "ASSET", normalBalance: "Dr", legacyCode: "AC003" },
+  { code: "1210", name: "Advances to Suppliers", group: "ASSETS", subGroup: "Current Assets", type: "ASSET", normalBalance: "Dr" },
+  { code: "1300", name: "Inventory – Stock in Trade", group: "ASSETS", subGroup: "Current Assets", type: "ASSET", normalBalance: "Dr", legacyCode: "AC004" },
+  { code: "1310", name: "Inventory – Raw Materials", group: "ASSETS", subGroup: "Current Assets", type: "ASSET", normalBalance: "Dr" },
+  { code: "1320", name: "Inventory – Consumables", group: "ASSETS", subGroup: "Current Assets", type: "ASSET", normalBalance: "Dr" },
+  { code: "1400", name: "CGST Input Credit", group: "ASSETS", subGroup: "Current Assets", type: "ASSET", normalBalance: "Dr", legacyCode: "AC005" },
+  { code: "1410", name: "SGST Input Credit", group: "ASSETS", subGroup: "Current Assets", type: "ASSET", normalBalance: "Dr" },
+  { code: "1420", name: "IGST Input Credit", group: "ASSETS", subGroup: "Current Assets", type: "ASSET", normalBalance: "Dr" },
+  { code: "1430", name: "TDS Receivable", group: "ASSETS", subGroup: "Current Assets", type: "ASSET", normalBalance: "Dr" },
+  { code: "1500", name: "Shop Equipment", group: "ASSETS", subGroup: "Fixed Assets", type: "ASSET", normalBalance: "Dr", legacyCode: "AC006" },
+  { code: "1510", name: "Furniture & Fixtures", group: "ASSETS", subGroup: "Fixed Assets", type: "ASSET", normalBalance: "Dr", legacyCode: "AC007" },
+  { code: "1520", name: "Vehicles", group: "ASSETS", subGroup: "Fixed Assets", type: "ASSET", normalBalance: "Dr" },
+  { code: "1530", name: "Computer & IT Equipment", group: "ASSETS", subGroup: "Fixed Assets", type: "ASSET", normalBalance: "Dr" },
+  { code: "1600", name: "Accumulated Depreciation", group: "ASSETS", subGroup: "Fixed Assets", type: "ASSET", normalBalance: "Cr" },
+
+  // 2000 – LIABILITIES
+  { code: "2000", name: "Accounts Payable", group: "LIABILITIES", subGroup: "Current Liabilities", type: "LIABILITY", normalBalance: "Cr", legacyCode: "AC010" },
+  { code: "2010", name: "Advances from Customers", group: "LIABILITIES", subGroup: "Current Liabilities", type: "LIABILITY", normalBalance: "Cr", legacyCode: "AC012" },
+  { code: "2100", name: "CGST Output Tax", group: "LIABILITIES", subGroup: "Current Liabilities", type: "LIABILITY", normalBalance: "Cr", legacyCode: "AC011" },
+  { code: "2110", name: "SGST Output Tax", group: "LIABILITIES", subGroup: "Current Liabilities", type: "LIABILITY", normalBalance: "Cr" },
+  { code: "2120", name: "IGST Output Tax", group: "LIABILITIES", subGroup: "Current Liabilities", type: "LIABILITY", normalBalance: "Cr" },
+  { code: "2130", name: "TDS Payable", group: "LIABILITIES", subGroup: "Current Liabilities", type: "LIABILITY", normalBalance: "Cr" },
+  { code: "2200", name: "Refunds Payable", group: "LIABILITIES", subGroup: "Current Liabilities", type: "LIABILITY", normalBalance: "Cr", legacyCode: "AC013" },
+  { code: "2300", name: "Term Loans", group: "LIABILITIES", subGroup: "Long Term", type: "LIABILITY", normalBalance: "Cr", legacyCode: "AC014" },
+  { code: "2310", name: "Vehicle Loans", group: "LIABILITIES", subGroup: "Long Term", type: "LIABILITY", normalBalance: "Cr" },
+  { code: "2400", name: "Statutory Dues", group: "LIABILITIES", subGroup: "Current Liabilities", type: "LIABILITY", normalBalance: "Cr" },
+
+  // 3000 – CAPITAL / EQUITY
+  { code: "3000", name: "Owner's Capital", group: "CAPITAL", subGroup: "Capital", type: "CAPITAL", normalBalance: "Cr", legacyCode: "AC050" },
+  { code: "3010", name: "Retained Earnings", group: "CAPITAL", subGroup: "Capital", type: "CAPITAL", normalBalance: "Cr", legacyCode: "AC051" },
+  { code: "3020", name: "Drawings", group: "CAPITAL", subGroup: "Capital", type: "CAPITAL", normalBalance: "Dr", legacyCode: "AC052" },
+
+  // 4000 – INCOME
+  { code: "4000", name: "Sales Revenue", group: "INCOME", subGroup: "Income", type: "INCOME", normalBalance: "Cr", legacyCode: "AC020" },
+  { code: "4010", name: "Service Income", group: "INCOME", subGroup: "Income", type: "INCOME", normalBalance: "Cr", legacyCode: "AC021" },
+  { code: "4020", name: "Discount Received", group: "INCOME", subGroup: "Other Income", type: "INCOME", normalBalance: "Cr", legacyCode: "AC022" },
+  { code: "4030", name: "Other Income", group: "INCOME", subGroup: "Other Income", type: "INCOME", normalBalance: "Cr", legacyCode: "AC023" },
+  { code: "4040", name: "Interest Income", group: "INCOME", subGroup: "Other Income", type: "INCOME", normalBalance: "Cr" },
+  { code: "4050", name: "Scrap / Salvage Income", group: "INCOME", subGroup: "Other Income", type: "INCOME", normalBalance: "Cr" },
+
+  // 5000 – EXPENSES
+  { code: "5000", name: "Cost of Goods Sold", group: "EXPENSES", subGroup: "Direct Expenses", type: "EXPENSE", normalBalance: "Dr", legacyCode: "AC030" },
+  { code: "5010", name: "Purchase Returns", group: "EXPENSES", subGroup: "Direct Expenses", type: "EXPENSE", normalBalance: "Dr", legacyCode: "AC031" },
+  { code: "5020", name: "Freight Inward", group: "EXPENSES", subGroup: "Direct Expenses", type: "EXPENSE", normalBalance: "Dr" },
+  { code: "5100", name: "Salaries & Wages", group: "EXPENSES", subGroup: "Operating Expenses", type: "EXPENSE", normalBalance: "Dr", legacyCode: "AC032" },
+  { code: "5110", name: "Rent", group: "EXPENSES", subGroup: "Operating Expenses", type: "EXPENSE", normalBalance: "Dr", legacyCode: "AC033" },
+  { code: "5120", name: "Electricity & Utilities", group: "EXPENSES", subGroup: "Operating Expenses", type: "EXPENSE", normalBalance: "Dr", legacyCode: "AC034" },
+  { code: "5130", name: "Marketing & Advertising", group: "EXPENSES", subGroup: "Operating Expenses", type: "EXPENSE", normalBalance: "Dr", legacyCode: "AC035" },
+  { code: "5140", name: "Delivery Charges", group: "EXPENSES", subGroup: "Operating Expenses", type: "EXPENSE", normalBalance: "Dr", legacyCode: "AC036" },
+  { code: "5150", name: "Customer Returns / Refunds", group: "EXPENSES", subGroup: "Operating Expenses", type: "EXPENSE", normalBalance: "Dr", legacyCode: "AC037" },
+  { code: "5160", name: "Depreciation", group: "EXPENSES", subGroup: "Operating Expenses", type: "EXPENSE", normalBalance: "Dr", legacyCode: "AC038" },
+  { code: "5170", name: "Bank Charges", group: "EXPENSES", subGroup: "Operating Expenses", type: "EXPENSE", normalBalance: "Dr", legacyCode: "AC039" },
+  { code: "5180", name: "Insurance", group: "EXPENSES", subGroup: "Operating Expenses", type: "EXPENSE", normalBalance: "Dr" },
+  { code: "5190", name: "Repairs & Maintenance", group: "EXPENSES", subGroup: "Operating Expenses", type: "EXPENSE", normalBalance: "Dr" },
+  { code: "5200", name: "Telephone & Internet", group: "EXPENSES", subGroup: "Operating Expenses", type: "EXPENSE", normalBalance: "Dr" },
+  { code: "5210", name: "Printing & Stationery", group: "EXPENSES", subGroup: "Operating Expenses", type: "EXPENSE", normalBalance: "Dr" },
+  { code: "5300", name: "Discount Given", group: "EXPENSES", subGroup: "Operating Expenses", type: "EXPENSE", normalBalance: "Dr" },
+  { code: "5400", name: "Miscellaneous Expenses", group: "EXPENSES", subGroup: "Operating Expenses", type: "EXPENSE", normalBalance: "Dr", legacyCode: "AC040" },
+];
+
+// ════════════════════════════════════════════════════════════════════════
+// PERIOD LOCKING — prevent editing transactions in closed months
+// ════════════════════════════════════════════════════════════════════════
+const PERIOD_LOCKS_KEY = "vl_period_locks";
+
+export function loadPeriodLocks() {
+  try {
+    const raw = localStorage.getItem(PERIOD_LOCKS_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch { return []; }
+}
+
+export function savePeriodLocks(locks) {
+  try {
+    localStorage.setItem(PERIOD_LOCKS_KEY, JSON.stringify(locks));
+  } catch { }
+}
+
+/**
+ * Check if a given date falls within a locked period.
+ * @param {number} timestamp — epoch ms
+ * @param {string} shopId — shop identifier
+ * @returns {{ locked: boolean, lockedUntil?: string }}
+ */
+export function isDateLocked(timestamp, shopId) {
+  const locks = loadPeriodLocks();
+  const d = new Date(timestamp);
+  const yearMonth = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+
+  for (const lock of locks) {
+    if (lock.shopId && lock.shopId !== shopId) continue;
+    if (lock.yearMonth === yearMonth && lock.locked) {
+      return { locked: true, lockedUntil: lock.yearMonth };
+    }
+  }
+  return { locked: false };
+}
+
+/**
+ * Toggle a period lock for a given month.
+ */
+export function togglePeriodLock(yearMonth, shopId, lock = true, lockedBy = "owner") {
+  const locks = loadPeriodLocks();
+  const idx = locks.findIndex(l => l.yearMonth === yearMonth && l.shopId === shopId);
+  if (idx >= 0) {
+    locks[idx].locked = lock;
+    locks[idx].lockedAt = Date.now();
+    locks[idx].lockedBy = lockedBy;
+  } else {
+    locks.push({ yearMonth, shopId, locked: lock, lockedAt: Date.now(), lockedBy });
+  }
+  savePeriodLocks(locks);
+  return locks;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// DOCUMENT REVERSAL — SAP-style immutable audit trail
+// Creates equal-opposite journal entry linked to original
+// ════════════════════════════════════════════════════════════════════════
+/**
+ * Create a reversal movement from an existing movement.
+ * The original document is NOT modified — a new "REVERSAL" movement is returned.
+ * @param {object} originalMovement — the movement to reverse
+ * @param {string} reason — reason for reversal
+ * @param {function} uidFn — uid generator function
+ * @returns {object} — new reversal movement
+ */
+export function createReversalMovement(originalMovement, reason, uidFn) {
+  const uid = uidFn || (() => Math.random().toString(36).slice(2, 10));
+  const revId = "rev_" + uid();
+  return {
+    ...originalMovement,
+    id: revId,
+    type: "REVERSAL",
+    originalMovementId: originalMovement.id,
+    originalInvoiceNo: originalMovement.invoiceNo,
+    invoiceNo: `REV-${originalMovement.invoiceNo || originalMovement.id}`,
+    qty: -(originalMovement.qty || 0),
+    total: -(originalMovement.total || 0),
+    gstAmount: -(originalMovement.gstAmount || 0),
+    profit: -(originalMovement.profit || 0),
+    note: `Reversal of ${originalMovement.invoiceNo || originalMovement.id}: ${reason}`,
+    date: Date.now(),
+    reversalReason: reason,
+    paymentStatus: "reversed",
+  };
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// FIFO COGS CALCULATION — tracks cost layer for each purchase batch
+// ════════════════════════════════════════════════════════════════════════
+/**
+ * Calculate COGS using FIFO for a specific product.
+ * @param {Array} movements — all movements sorted by date
+ * @param {string} productId — product to calculate for
+ * @returns {{ totalCOGS: number, layers: Array, currentStock: number, avgCost: number }}
+ */
+export function computeFIFOCOGS(movements, productId) {
+  const sorted = (movements || [])
+    .filter(m => m.productId === productId)
+    .sort((a, b) => a.date - b.date);
+
+  const layers = []; // Each layer: { qty, costPerUnit, date, invoiceNo }
+  let totalCOGS = 0;
+
+  sorted.forEach(m => {
+    if (m.type === "PURCHASE" || m.type === "OPENING_STOCK") {
+      layers.push({
+        qty: m.qty || 0,
+        costPerUnit: m.unitPrice || 0,
+        date: m.date,
+        invoiceNo: m.invoiceNo || "",
+      });
+    } else if (m.type === "SALE" || m.type === "RETURN_OUT") {
+      let remaining = m.qty || 0;
+      while (remaining > 0 && layers.length > 0) {
+        const oldest = layers[0];
+        if (oldest.qty <= remaining) {
+          totalCOGS += oldest.qty * oldest.costPerUnit;
+          remaining -= oldest.qty;
+          layers.shift();
+        } else {
+          totalCOGS += remaining * oldest.costPerUnit;
+          oldest.qty -= remaining;
+          remaining = 0;
+        }
+      }
+    } else if (m.type === "RETURN_IN") {
+      // Customer return — add back to inventory at last FIFO cost
+      const lastCost = layers.length > 0 ? layers[layers.length - 1].costPerUnit : (m.unitPrice || 0);
+      layers.push({
+        qty: m.qty || 0,
+        costPerUnit: lastCost,
+        date: m.date,
+        invoiceNo: m.invoiceNo || "RETURN",
+      });
+    }
+  });
+
+  const currentStock = layers.reduce((s, l) => s + l.qty, 0);
+  const currentValue = layers.reduce((s, l) => s + (l.qty * l.costPerUnit), 0);
+  const avgCost = currentStock > 0 ? currentValue / currentStock : 0;
+
+  return { totalCOGS, layers, currentStock, currentValue, avgCost: Math.round(avgCost * 100) / 100 };
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// GST LEDGER — collected vs paid, net liability
+// ════════════════════════════════════════════════════════════════════════
+export function computeGSTLedger(journalEntries, startDate, endDate) {
+  let cgstOutput = 0, sgstOutput = 0, igstOutput = 0;
+  let cgstInput = 0, sgstInput = 0, igstInput = 0;
+
+  // Use both legacy (AC005/AC011) and new codes
+  const outputCodes = new Set(["AC011", "2100", "2110", "2120"]);
+  const inputCodes = new Set(["AC005", "1400", "1410", "1420"]);
+
+  (journalEntries || []).forEach(je => {
+    if (startDate && je.date < startDate) return;
+    if (endDate && je.date > endDate) return;
+
+    je.entries.forEach(e => {
+      if (outputCodes.has(e.accountCode)) {
+        const amt = (e.credit || 0) - (e.debit || 0);
+        if (e.accountCode === "2100" || e.accountCode === "AC011") cgstOutput += amt / 2; // Split IGST assumption
+        if (e.accountCode === "2110") sgstOutput += amt;
+        if (e.accountCode === "2120") igstOutput += amt;
+        // Legacy single account — split equally
+        if (e.accountCode === "AC011") { cgstOutput += amt / 2; sgstOutput += amt / 2; cgstOutput -= amt / 2; }
+      }
+      if (inputCodes.has(e.accountCode)) {
+        const amt = (e.debit || 0) - (e.credit || 0);
+        if (e.accountCode === "1400" || e.accountCode === "AC005") cgstInput += amt / 2;
+        if (e.accountCode === "1410") sgstInput += amt;
+        if (e.accountCode === "1420") igstInput += amt;
+        if (e.accountCode === "AC005") { cgstInput += amt / 2; sgstInput += amt / 2; cgstInput -= amt / 2; }
+      }
+    });
+  });
+
+  // For legacy accounts that don't split CGST/SGST, aggregate
+  const totalOutput = cgstOutput + sgstOutput + igstOutput;
+  const totalInput = cgstInput + sgstInput + igstInput;
+  const netLiability = totalOutput - totalInput;
+
+  return {
+    cgstOutput: Math.round(cgstOutput),
+    sgstOutput: Math.round(sgstOutput),
+    igstOutput: Math.round(igstOutput),
+    totalOutput: Math.round(totalOutput),
+    cgstInput: Math.round(cgstInput),
+    sgstInput: Math.round(sgstInput),
+    igstInput: Math.round(igstInput),
+    totalInput: Math.round(totalInput),
+    netLiability: Math.round(netLiability),
+    itcUtilised: Math.min(Math.round(totalInput), Math.round(totalOutput)),
+    cashPayable: Math.max(0, Math.round(netLiability)),
   };
 }

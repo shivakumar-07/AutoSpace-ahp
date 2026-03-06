@@ -4,6 +4,7 @@ import { fmt, fmtDate, fmtDateTime, uid, generateCSV, downloadCSV, generateWhats
 import { Badge, Btn, StatCard, EmptyState } from "../components/ui";
 import {
   CHART_OF_ACCOUNTS,
+  EXPANDED_COA,
   generateJournalEntries,
   computeLedger,
   computeTrialBalance,
@@ -14,6 +15,11 @@ import {
   computeCostSheet,
   computeOutstandingAging,
   computeCostCentrePnL,
+  loadPeriodLocks,
+  togglePeriodLock,
+  computeFIFOCOGS,
+  computeGSTLedger,
+  createReversalMovement,
 } from "../accounting";
 import { getNextVoucherNumber } from "../voucherNumbering";
 import {
@@ -1401,6 +1407,39 @@ export function AccountingPage({ movements, products, parties, activeShopId, toa
             )}
           </div>
         )}
+
+        {/* ── Period Locks (Monthly) ── */}
+        <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 12, padding: 16, marginTop: 20 }}>
+          <SectionHeader title="MONTHLY PERIOD LOCKS" color="#06B6D4" />
+          <div style={{ fontSize: 12, color: T.t3, marginBottom: 12 }}>Lock individual months to prevent transaction modifications. Locked months cannot have vouchers added, edited, or deleted.</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8 }}>
+            {(() => {
+              const months = [];
+              const fy = selectedClosingYear;
+              for (let i = 3; i <= 14; i++) {
+                const mo = i % 12;
+                const yr = i < 12 ? fy : fy + 1;
+                const ym = `${yr}-${String(mo + 1).padStart(2, '0')}`;
+                const label = new Date(yr, mo, 1).toLocaleDateString('en-IN', { month: 'short', year: '2-digit' });
+                const locks = loadPeriodLocks();
+                const isLk = locks.some(l => l.yearMonth === ym && l.locked && (!l.shopId || l.shopId === activeShopId));
+                months.push(
+                  <button key={ym} onClick={() => { togglePeriodLock(ym, activeShopId, !isLk); toast(`${label} ${isLk ? 'unlocked' : 'locked'}`, isLk ? 'info' : 'success'); setYearEndConfirm(prev => !prev); }} style={{
+                    padding: '10px 12px', borderRadius: 8, cursor: 'pointer', fontFamily: FONT.ui,
+                    background: isLk ? '#06B6D418' : T.surface,
+                    border: `1px solid ${isLk ? '#06B6D4' : T.border}`,
+                    color: isLk ? '#06B6D4' : T.t2, fontSize: 12, fontWeight: 700,
+                    display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+                    transition: 'all 0.15s',
+                  }}>
+                    <span>{isLk ? '🔒' : '🔓'}</span> {label}
+                  </button>
+                );
+              }
+              return months;
+            })()}
+          </div>
+        </div>
       </div>
     );
   };
